@@ -7,6 +7,8 @@ import os
 final class AppModel: ObservableObject {
     let settings = AppSettings()
     let keychain = Keychain()
+    let chatGPTAuth: OAuthSession
+    let antigravityAuth: OAuthSession
     let store: HistoryStore?
     let speech = Speech()
 
@@ -15,6 +17,8 @@ final class AppModel: ObservableObject {
     /// Bumped whenever history or favorites change so open windows reload.
     @Published private(set) var dataVersion = 0
     @Published private(set) var storeError: String?
+    /// Signed-in OAuth accounts, for display.
+    @Published private(set) var accounts: [TranslationService: OAuthTokens] = [:]
 
     private(set) var flow: TranslationFlow!
     private(set) var popup: PopupController!
@@ -22,6 +26,8 @@ final class AppModel: ObservableObject {
     private let logger = Logger(subsystem: "app.huaci.Huaci", category: "app")
 
     init() {
+        chatGPTAuth = OAuthSession(provider: .chatGPT, store: KeychainCredentialStore(keychain: keychain, key: .chatGPTOAuth))
+        antigravityAuth = OAuthSession(provider: .antigravity, store: KeychainCredentialStore(keychain: keychain, key: .antigravityOAuth))
         do {
             store = try HistoryStore(url: HistoryStore.defaultURL())
         } catch {
@@ -40,6 +46,7 @@ final class AppModel: ObservableObject {
         )
         popup = PopupController(model: self)
         flow.presenter = popup
+        refreshAccounts()
     }
 
     // MARK: Translation
@@ -66,12 +73,71 @@ final class AppModel: ObservableObject {
     }
 
     func makeTranslator() throws -> Translator {
-        let config = PersonalAPIConfig(
-            baseURL: settings.personalBaseURL,
-            apiKey: keychain.read(.personalAPIKey) ?? "",
-            model: settings.personalModel
-        )
-        return try OpenAICompatibleTranslator(config: config)
+        switch settings.activeService {
+        case .personalAPI:
+            let config = PersonalAPIConfig(
+                baseURL: settings.personalBaseURL,
+                apiKey: keychain.read(.personalAPIKey) ?? "",
+                model: settings.personalModel
+            )
+            return try OpenAICompatibleTranslator(config: config)
+        case .chatGPT:
+            return try ChatGPTTranslator(auth: chatGPTAuth, model: settings.chatGPTModel)
+        case .antigravity:
+            return try AntigravityTranslator(auth: antigravityAuth, model: settings.antigravityModel)
+        }
+    }
+
+    /// Translates a sample word with the active service.
+    func testConnection() async -> (message: String, failed: Bool) {
+        let request = TranslationRequest(text: "hello", kind: .word, sourceLanguage: "en", targetLanguage: .named("zh-Hans"))
+        do {
+            let result = try await makeTranslator().translate(request)
+            return ("连接成功：hello → \(result.translation)", false)
+        } catch {
+            return ((error as? TranslationError)?.userMessage ?? error.localizedDescription, true)
+        }
+    }
+
+    // MARK: Services
+
+    func auth(for service: TranslationService) -> OAuthSession? {
+        switch service {
+        case .personalAPI: return nil
+        case .chatGPT: return chatGPTAuth
+        case .antigravity: return antigravityAuth
+        }
+    }
+
+    /// Whether the service has credentials; the menu marks the others.
+    func isConfigured(_ service: TranslationService) -> Bool {
+        switch service {
+        case .personalAPI: return keychain.read(.personalAPIKey) != nil && !settings.personalModel.isEmpty
+        case .chatGPT, .antigravity: return accounts[service] != nil
+        }
+    }
+
+    /// Opens the provider's sign-in page in the browser and waits for the redirect.
+    func signIn(_ service: TranslationService) async throws {
+        guard let auth = auth(for: service) else { return }
+        try await auth.signIn { url in
+            await MainActor.run { _ = NSWorkspace.shared.open(url) }
+        }
+        refreshAccounts()
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func signOut(_ service: TranslationService) async {
+        await auth(for: service)?.signOut()
+        refreshAccounts()
+    }
+
+    private func refreshAccounts() {
+        var accounts: [TranslationService: OAuthTokens] = [:]
+        for service in TranslationService.allCases {
+            if let tokens = auth(for: service)?.tokens { accounts[service] = tokens }
+        }
+        self.accounts = accounts
     }
 
     func retry() {

@@ -44,6 +44,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item("开启辅助功能权限…", #selector(openAccessibility)))
         }
         menu.addItem(.separator())
+        let services = NSMenu()
+        for service in TranslationService.allCases {
+            let title = model.isConfigured(service) ? service.displayName : "\(service.displayName)（未配置）"
+            let entry = item(title, #selector(selectService(_:)))
+            entry.representedObject = service.rawValue
+            entry.state = model.settings.activeService == service ? .on : .off
+            services.addItem(entry)
+        }
+        let servicesItem = NSMenuItem(title: "翻译服务：\(model.settings.activeService.displayName)", action: nil, keyEquivalent: "")
+        servicesItem.submenu = services
+        menu.addItem(servicesItem)
+        menu.addItem(.separator())
         menu.addItem(item("查询历史…", #selector(showHistory)))
         menu.addItem(item("生词本…", #selector(showVocabulary)))
         menu.addItem(item("设置…", #selector(showSettings), key: ","))
@@ -82,6 +94,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func translate() { model.triggerTranslation() }
+    /// Switches the service; an unconfigured one opens settings to set it up.
+    @objc private func selectService(_ sender: NSMenuItem) {
+        guard let service = (sender.representedObject as? String).flatMap(TranslationService.init(rawValue:)) else { return }
+        model.settings.activeService = service
+        if !model.isConfigured(service) { WindowRouter.shared.showSettings() }
+    }
     @objc private func showHistory() { WindowRouter.shared.showHistory() }
     @objc private func showVocabulary() { WindowRouter.shared.showVocabulary() }
     @objc private func showSettings() { WindowRouter.shared.showSettings() }

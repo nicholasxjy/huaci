@@ -4,6 +4,10 @@ public protocol Translator: Sendable {
     func translate(_ request: TranslationRequest) async throws -> TranslationResult
 }
 
+public enum TranslationLimits {
+    public static let maxInputCharacters = 8000
+}
+
 // MARK: - Personal OpenAI-compatible API
 
 public struct PersonalAPIConfig: Equatable, Sendable {
@@ -21,7 +25,7 @@ public struct PersonalAPIConfig: Equatable, Sendable {
 /// Calls `/chat/completions` on a user-provided OpenAI-compatible endpoint. The
 /// key is sent only to that endpoint.
 public final class OpenAICompatibleTranslator: Translator {
-    public static let maxInputCharacters = 8000
+    public static let maxInputCharacters = TranslationLimits.maxInputCharacters
 
     private let config: PersonalAPIConfig
     private let endpoint: URL
@@ -82,13 +86,7 @@ public final class OpenAICompatibleTranslator: Translator {
 
         let (data, response) = try await HTTP.perform(urlRequest, session: session)
         guard (200..<300).contains(response.statusCode) else {
-            let message = HTTP.openAIErrorMessage(data)
-            switch response.statusCode {
-            case 401, 403: throw TranslationError.unauthorized
-            case 429: throw TranslationError.rateLimited
-            case 408, 504: throw TranslationError.timeout
-            default: throw TranslationError.http(status: response.statusCode, message: message)
-            }
+            throw HTTP.error(status: response.statusCode, data: data)
         }
 
         struct Completion: Decodable {
@@ -108,6 +106,10 @@ public final class OpenAICompatibleTranslator: Translator {
 
 // MARK: - HTTP helpers
 
+/// All OAuth and translation traffic goes through `URLSession.shared` (or a
+/// session from `URLSessionConfiguration.default`), which follows the system
+/// proxy settings, including PAC. Do not set `connectionProxyDictionary` or
+/// switch to raw sockets for these requests.
 enum HTTP {
     static func perform(_ request: URLRequest, session: URLSession) async throws -> (Data, HTTPURLResponse) {
         do {
@@ -127,12 +129,25 @@ enum HTTP {
         }
     }
 
+    static func error(status: Int, data: Data) -> TranslationError {
+        switch status {
+        case 401, 403: return .unauthorized
+        case 429: return .rateLimited
+        case 408, 504: return .timeout
+        default: return .http(status: status, message: openAIErrorMessage(data))
+        }
+    }
+
+    /// `error.message` (OpenAI, Google) or `detail` (ChatGPT backend), else the
+    /// start of the body.
     static func openAIErrorMessage(_ data: Data) -> String? {
         struct Reply: Decodable {
             struct Detail: Decodable { let message: String? }
             let error: Detail?
+            let detail: String?
         }
-        if let message = (try? JSONDecoder().decode(Reply.self, from: data))?.error?.message { return message }
+        let reply = try? JSONDecoder().decode(Reply.self, from: data)
+        if let message = reply?.error?.message ?? reply?.detail { return message }
         let text = String(data: data.prefix(300), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
         return text?.isEmpty == false ? text : nil
     }
