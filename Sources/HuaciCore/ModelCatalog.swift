@@ -69,29 +69,85 @@ public enum ModelCatalog {
             .map { RemoteModel(id: $0.slug, displayName: $0.display_name) }
     }
 
-    /// `v1internal:fetchAvailableModels` for the account's project. Entries
-    /// without a display name are internal and left out.
+    /// `v1internal:fetchAvailableModels` for the account's project, named
+    /// with its tier as Antigravity does (a tier Google won't take is dropped,
+    /// down to none). Chat models only, in the order Antigravity's picker shows
+    /// them; its usual models when it lists none.
     public static func antigravity(auth: OAuthSession, session: URLSession = .shared,
-                                   endpoints: [URL] = AntigravityTranslator.endpoints) async throws -> [RemoteModel] {
-        let data = try await AntigravityTranslator.firstReachable(endpoints) { endpoint in
-            let url = endpoint.appendingPathComponent("v1internal:fetchAvailableModels")
-            return try await auth.send(session: session) { tokens in
-                var request = URLRequest(url: url, timeoutInterval: 20)
-                request.httpMethod = "POST"
-                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.setValue("Bearer \(tokens.accessToken)", forHTTPHeaderField: "Authorization")
-                request.setValue(AntigravityAuth.userAgent, forHTTPHeaderField: "User-Agent")
-                request.httpBody = try JSONSerialization.data(withJSONObject: ["project": tokens.projectID ?? AntigravityAuth.fallbackProjectID])
-                return request
+                                   backend: AntigravityBackend = .live) async throws -> [RemoteModel] {
+        let tokens = try await auth.validTokens()
+        let project = try await AntigravityAuth.project(accessToken: tokens.accessToken, storedID: tokens.projectID,
+                                                        session: session, backend: backend)
+        let url = backend.url(backend.base, "fetchAvailableModels")
+        let userAgent = backend.userAgent(version: await backend.version())
+
+        var reply: Data?
+        var lastError: Error = TranslationError.invalidResponse
+        for tier in project.entitlements.map(Optional.some) + [nil] {
+            var body: [String: Any] = ["project": project.id]
+            if let tier { body["entitlement"] = ["userTier": tier] }
+            let payload = try JSONSerialization.data(withJSONObject: body)
+            do {
+                reply = try await auth.send(session: session) { tokens in
+                    var request = URLRequest(url: url, timeoutInterval: 20)
+                    request.httpMethod = "POST"
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    request.setValue("Bearer \(tokens.accessToken)", forHTTPHeaderField: "Authorization")
+                    request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+                    request.httpBody = payload
+                    return request
+                }
+                break
+            } catch TranslationError.cancelled {
+                throw TranslationError.cancelled
+            } catch {
+                lastError = error
             }
         }
-        let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        guard let reply else { throw lastError }
+
+        let root = (try? JSONSerialization.jsonObject(with: reply)) as? [String: Any]
         guard let entries = root?["models"] as? [String: Any] else { throw TranslationError.invalidResponse }
-        return entries
-            .compactMap { id, value -> RemoteModel? in
-                guard let name = (value as? [String: Any])?["displayName"] as? String, !name.isEmpty else { return nil }
-                return RemoteModel(id: id, displayName: name)
+        var rank: [String: Int] = [:]
+        for sort in root?["agentModelSorts"] as? [[String: Any]] ?? [] {
+            for group in sort["groups"] as? [[String: Any]] ?? [] {
+                for id in group["modelIds"] as? [String] ?? [] where rank[id] == nil {
+                    rank[id] = rank.count
+                }
             }
-            .sorted { $0.id < $1.id }
+        }
+        let known = Dictionary(uniqueKeysWithValues: antigravityModels.map { ($0.id, $0.displayName) })
+        let models = entries
+            .compactMap { id, value -> RemoteModel? in
+                guard !antigravityHidden.contains(id), !id.hasPrefix("chat_"), !id.hasPrefix("tab_") else { return nil }
+                let name = ((value as? [String: Any])?["displayName"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                return RemoteModel(id: id, displayName: name ?? known[id] ?? nil)
+            }
+            .sorted { a, b in
+                switch (rank[a.id], rank[b.id]) {
+                case let (x?, y?): return x < y
+                case (.some, nil): return true
+                case (nil, .some): return false
+                case (nil, nil): return a.id < b.id
+                }
+            }
+        return models.isEmpty ? antigravityModels : models
     }
+
+    /// The models Antigravity offers, for when it doesn't say.
+    static let antigravityModels = [
+        RemoteModel(id: "gemini-3-flash", displayName: "Gemini 3 Flash"),
+        RemoteModel(id: "gemini-3.1-pro-low", displayName: "Gemini 3.1 Pro (Low)"),
+        RemoteModel(id: "gemini-pro-agent", displayName: "Gemini 3.1 Pro (High)"),
+        RemoteModel(id: "gemini-3.1-flash-lite", displayName: "Gemini 3.1 Flash Lite"),
+        RemoteModel(id: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6"),
+        RemoteModel(id: "claude-opus-4-6-thinking", displayName: "Claude Opus 4.6 (Thinking)"),
+        RemoteModel(id: "gpt-oss-120b-medium", displayName: "GPT-OSS 120B (Medium)"),
+    ]
+
+    /// Models Antigravity lists that aren't for chat.
+    static let antigravityHidden: Set<String> = [
+        "chat_20706", "chat_23310", "tab_flash_lite_preview", "tab_jump_flash_lite_preview",
+        "gemini-2.5-flash-thinking", "gemini-2.5-pro",
+    ]
 }

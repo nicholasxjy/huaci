@@ -21,9 +21,12 @@ func completedEvents(_ text: String) -> String {
     ])
 }
 
-func geminiReply(_ parts: [[String: Any]]) -> String {
-    let body: [String: Any] = ["response": ["candidates": [["content": ["role": "model", "parts": parts]]]]]
-    return String(decoding: try! JSONSerialization.data(withJSONObject: body), as: UTF8.self)
+/// Code Assist's server-sent events: one `{response}` chunk per element.
+func geminiStream(_ chunks: [[[String: Any]]]) -> String {
+    chunks.map { parts in
+        let body: [String: Any] = ["response": ["candidates": [["content": ["role": "model", "parts": parts]]]]]
+        return "data: " + String(decoding: try! JSONSerialization.data(withJSONObject: body), as: UTF8.self) + "\r\n\r\n"
+    }.joined()
 }
 
 extension TranslatorTests {
@@ -109,63 +112,96 @@ extension TranslatorTests {
 
     @Suite struct Antigravity {
         let request = TranslationRequest(text: "Hello world.", kind: .text, sourceLanguage: "en", targetLanguage: .named("zh-Hans"))
-        let endpoints = [URL(string: "https://daily.example.com")!, URL(string: "https://prod.example.com")!]
+        static let backend = AntigravityBackend(base: URL(string: "https://daily.example.com")!,
+                                                loadBase: URL(string: "https://prod.example.com")!,
+                                                version: { "9.9.9" })
 
-        func translator(_ replies: [StubURLProtocol.Reply], model: String = "gemini-3-flash") throws -> AntigravityTranslator {
+        func translator(_ replies: [StubURLProtocol.Reply], model: String = "gemini-3-flash",
+                        tokens: OAuthTokens = TranslatorTests.freshTokens) throws -> AntigravityTranslator {
             let session = StubURLProtocol.session(replies)
-            let auth = OAuthSession(provider: .antigravity, store: MemoryCredentialStore(TranslatorTests.freshTokens), session: session)
-            return try AntigravityTranslator(auth: auth, model: model, session: session, endpoints: endpoints)
+            let auth = OAuthSession(provider: .antigravity, store: MemoryCredentialStore(tokens), session: session)
+            return try AntigravityTranslator(auth: auth, model: model, session: session, backend: Self.backend)
         }
 
-        @Test func wrapsRequestForCloudCodeAssist() async throws {
-            let translator = try translator([.init(status: 200, body: geminiReply([
-                ["text": "thinking…", "thought": true],
-                ["text": #"{"kind":"text","translation":"你好，世界。"}"#],
+        @Test func streamsRequestAsAntigravityDoes() async throws {
+            let translator = try translator([.init(status: 200, body: geminiStream([
+                [["text": "thinking…", "thought": true]],
+                [["text": #"{"kind":"text","#]],
+                [["text": #""translation":"你好，世界。"}"#]],
             ]))])
 
             let result = try await translator.translate(request)
 
             #expect(result.translation == "你好，世界。")
             let sent = try #require(StubURLProtocol.requests.first).request
-            #expect(sent.url?.absoluteString == "https://daily.example.com/v1internal:generateContent")
+            #expect(sent.url?.absoluteString == "https://daily.example.com/v1internal:streamGenerateContent?alt=sse")
             #expect(sent.value(forHTTPHeaderField: "Authorization") == "Bearer at")
-            #expect(sent.value(forHTTPHeaderField: "User-Agent")?.hasPrefix("antigravity/") == true)
+            #expect(sent.value(forHTTPHeaderField: "User-Agent")?.hasPrefix("antigravity/hub/9.9.9 darwin/") == true)
             let body = try StubURLProtocol.bodyJSON(0)
             #expect(body["project"] as? String == "proj-1")
             #expect(body["model"] as? String == "gemini-3-flash")
             #expect(body["userAgent"] as? String == "antigravity")
+            #expect(body["requestType"] as? String == "agent")
+            #expect((body["requestId"] as? String)?.hasPrefix("agent-") == true)
             let inner = try #require(body["request"] as? [String: Any])
+            #expect((inner["sessionId"] as? String)?.hasPrefix("-") == true)
             let contents = try #require(inner["contents"] as? [[String: Any]])
             let parts = try #require(contents.first?["parts"] as? [[String: String]])
             #expect(contents.first?["role"] as? String == "user")
             #expect(parts.first?["text"]?.contains("<source>\nHello world.\n</source>") == true)
             let system = try #require(inner["systemInstruction"] as? [String: Any])
-            let systemParts = try #require(system["parts"] as? [[String: String]])
-            #expect(systemParts.contains { $0["text"]?.contains("professional translator") == true })
+            let systemText = try #require(system["parts"] as? [[String: String]]).compactMap { $0["text"] }.joined()
+            #expect(systemText.contains("professional translator"))
+            #expect(!systemText.contains("You are Antigravity"))
         }
 
-        @Test func fallsBackToNextEndpointOnServerError() async throws {
+        @Test func sessionIDFollowsFirstMessage() {
+            #expect(AntigravityTranslator.sessionID(for: "a") == AntigravityTranslator.sessionID(for: "a"))
+            #expect(AntigravityTranslator.sessionID(for: "a") != AntigravityTranslator.sessionID(for: "b"))
+            let id = AntigravityTranslator.sessionID(for: "a")
+            #expect(id.count > 1 && id.dropFirst().allSatisfy { $0.isNumber })
+        }
+
+        @Test func errorsAreMapped() async throws {
+            let limited = try translator([.init(status: 429, body: #"{"error":{"message":"quota","status":"RESOURCE_EXHAUSTED"}}"#)])
+            await #expect(throws: TranslationError.rateLimited) { try await limited.translate(request) }
+
+            let rejected = try translator([.init(status: 400, body: #"{"error":{"message":"unknown model"}}"#)])
+            await #expect(throws: TranslationError.http(status: 400, message: "unknown model")) { try await rejected.translate(request) }
+            #expect(StubURLProtocol.requests.count == 1)
+
+            let streamed = try translator([.init(status: 200, body: "data: {\"error\":{\"message\":\"overloaded\"}}\n\n")])
+            await #expect(throws: TranslationError.rejected("overloaded")) { try await streamed.translate(request) }
+        }
+
+        @Test func findsProjectWhenSignInHadNone() async throws {
+            var tokens = TranslatorTests.freshTokens
+            tokens.projectID = nil
             let translator = try translator([
-                .init(status: 503, body: #"{"error":{"message":"unavailable"}}"#),
-                .init(status: 200, body: geminiReply([["text": "你好"]])),
-            ])
+                .init(status: 200, body: #"{"cloudaicompanionProject":{"id":"proj-9"},"currentTier":{"id":"free-tier"}}"#),
+                .init(status: 200, body: geminiStream([[["text": #"{"kind":"text","translation":"你好"}"#]]])),
+            ], tokens: tokens)
 
             #expect(try await translator.translate(request).translation == "你好")
-            #expect(StubURLProtocol.requests.map { $0.request.url?.host } == ["daily.example.com", "prod.example.com"])
+            #expect(StubURLProtocol.requests[0].request.url?.absoluteString == "https://prod.example.com/v1internal:loadCodeAssist")
+            #expect(try StubURLProtocol.bodyJSON(1)["project"] as? String == "proj-9")
         }
 
-        @Test func lastEndpointErrorIsReported() async throws {
+        @Test func accountWithoutProjectGetsGooglesReason() async throws {
+            var tokens = TranslatorTests.freshTokens
+            tokens.projectID = nil
             let translator = try translator([
-                .init(status: 503, body: "{}"),
-                .init(status: 429, body: #"{"error":{"message":"quota","status":"RESOURCE_EXHAUSTED"}}"#),
-            ])
-            await #expect(throws: TranslationError.rateLimited) { try await translator.translate(request) }
-        }
+                .init(status: 200, body: #"{"allowedTiers":[{"id":"free-tier","isDefault":true}],"ineligibleTiers":[{"reasonMessage":"Not available in your region"}]}"#),
+                .init(status: 200, body: #"{"done":true,"response":{}}"#),
+            ], tokens: tokens)
 
-        @Test func clientErrorsDoNotFallBack() async throws {
-            let translator = try translator([.init(status: 400, body: #"{"error":{"message":"unknown model"}}"#)])
-            await #expect(throws: TranslationError.http(status: 400, message: "unknown model")) { try await translator.translate(request) }
-            #expect(StubURLProtocol.requests.count == 1)
+            await #expect {
+                try await translator.translate(request)
+            } throws: { error in
+                guard case TranslationError.notConfigured(let message) = error else { return false }
+                return message.contains("Not available in your region")
+            }
+            #expect(StubURLProtocol.requests.count == 2)
         }
 
         @Test func signInResolvesEmailAndProject() async throws {
@@ -175,12 +211,14 @@ extension TranslatorTests {
             ])
             let response = OAuthTokenResponse(accessToken: "at", refreshToken: "rt", idToken: nil, expiresIn: 3600)
 
-            let account = try await OAuthProvider.antigravity.resolveAccount(response, session)
+            let account = try await AntigravityAuth.resolveAccount(response, session: session, backend: Self.backend)
 
             #expect(account.email == "me@gmail.com")
             #expect(account.projectID == "proj-9")
-            #expect(StubURLProtocol.requests[1].request.url?.absoluteString.hasSuffix("/v1internal:loadCodeAssist") == true)
-            #expect(StubURLProtocol.requests[1].request.value(forHTTPHeaderField: "Authorization") == "Bearer at")
+            let load = StubURLProtocol.requests[1].request
+            #expect(load.url?.absoluteString == "https://prod.example.com/v1internal:loadCodeAssist")
+            #expect(load.value(forHTTPHeaderField: "Authorization") == "Bearer at")
+            #expect(try StubURLProtocol.bodyJSON(1)["metadata"] as? [String: String] == ["ideType": "ANTIGRAVITY"])
         }
 
         @Test func signInOnboardsWhenNoProjectExists() async throws {
@@ -191,10 +229,28 @@ extension TranslatorTests {
             ])
             let response = OAuthTokenResponse(accessToken: "at", refreshToken: "rt", idToken: nil, expiresIn: 3600)
 
-            let account = try await OAuthProvider.antigravity.resolveAccount(response, session)
+            let account = try await AntigravityAuth.resolveAccount(response, session: session, backend: Self.backend)
 
             #expect(account.projectID == "proj-new")
-            #expect(try StubURLProtocol.bodyJSON(2)["tierId"] as? String == "free-tier")
+            let onboard = StubURLProtocol.requests[2].request
+            #expect(onboard.url?.absoluteString == "https://daily.example.com/v1internal:onboardUser")
+            #expect(onboard.value(forHTTPHeaderField: "X-Goog-Api-Client") != nil)
+            let body = try StubURLProtocol.bodyJSON(2)
+            #expect(body["tier_id"] as? String == "free-tier")
+            #expect(body["metadata"] as? [String: String] == ["ide_type": "ANTIGRAVITY", "ide_version": "9.9.9", "ide_name": "antigravity"])
+        }
+
+        @Test func versionComesFromUpdaterManifest() async throws {
+            #expect(AntigravityVersion.parse("version: 2.10.3\nfiles:\n  - url: x\n") == "2.10.3")
+            #expect(AntigravityVersion.parse("version: '3.0.1'\n") == "3.0.1")
+            #expect(AntigravityVersion.parse("version: beta\n") == nil)
+
+            let live = AntigravityVersion(session: StubURLProtocol.session([.init(status: 200, body: "version: 2.10.3\n")]))
+            #expect(await live.current() == "2.10.3")
+            #expect(StubURLProtocol.requests.first?.request.value(forHTTPHeaderField: "User-Agent") == "electron-builder")
+
+            let offline = AntigravityVersion(session: StubURLProtocol.session([.init(status: 500, body: "")]))
+            #expect(await offline.current() == AntigravityVersion.fallback)
         }
     }
 }

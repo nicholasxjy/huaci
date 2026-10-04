@@ -6,7 +6,7 @@ macOS 菜单栏划词翻译：在任意应用中选中文字，按快捷键（�
 | --- | --- | --- |
 | 个人 API | 服务地址 + API Key + 模型 | 任意 OpenAI 兼容的 Chat Completions 接口 |
 | ChatGPT 账号 | 浏览器 OAuth 登录（与 Codex CLI 的 “Sign in with ChatGPT” 相同） | 使用 ChatGPT 订阅额度，请求 `chatgpt.com/backend-api/codex/responses`；回调端口 1455 |
-| Antigravity | 浏览器 Google OAuth 登录（Antigravity 的客户端） | 使用 Antigravity 的模型额度，请求 Cloud Code Assist `v1internal:generateContent`；回调端口 51121 |
+| Antigravity | 浏览器 Google OAuth 登录（Antigravity 的客户端） | 使用 Antigravity 的模型额度，请求 Cloud Code Assist `v1internal:streamGenerateContent`；回调端口 51121 |
 
 各服务的配置与登录状态分别保存，切换时无需重新登录。ChatGPT 与 Antigravity 都不是公开 API，接口随时可能变化；**Antigravity 方式可能违反 Google 服务条款，已有用户报告账号被限制或封禁**，请自行评估风险。
 

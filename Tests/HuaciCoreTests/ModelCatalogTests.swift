@@ -60,33 +60,56 @@ extension TranslatorTests {
             #expect(sent.value(forHTTPHeaderField: "ChatGPT-Account-Id") == "acct-1")
         }
 
-        @Test func antigravityListsModelsForProject() async throws {
+        @Test func antigravityListsChatModelsInPickerOrder() async throws {
             let session = StubURLProtocol.session([
-                .init(status: 503, body: ""),
+                .init(status: 200, body: #"{"cloudaicompanionProject":"proj-1","currentTier":{"id":"standard-tier"},"paidTier":{"id":"g1-pro-tier"}}"#),
+                .init(status: 400, body: #"{"error":{"message":"FAILED_PRECONDITION"}}"#),
                 .init(status: 200, body: """
                 {"models":{
                   "gemini-3-flash":{"displayName":"Gemini 3 Flash"},
                   "claude-sonnet-4-6":{"displayName":"Claude Sonnet 4.6"},
-                  "chat_20706":{}
-                }}
+                  "gemini-3.1-pro-low":{"displayName":""},
+                  "gemini-2.5-pro":{"displayName":"Gemini 2.5 Pro"},
+                  "chat_20706":{},
+                  "tab_flash_lite_preview":{}
+                },
+                "agentModelSorts":[{"groups":[{"modelIds":["claude-sonnet-4-6","gemini-3-flash"]}]}]}
                 """),
             ])
             let auth = OAuthSession(provider: .antigravity, store: MemoryCredentialStore(TranslatorTests.freshTokens), session: session)
-            let endpoints = [URL(string: "https://daily.example.com")!, URL(string: "https://prod.example.com")!]
 
-            let models = try await ModelCatalog.antigravity(auth: auth, session: session, endpoints: endpoints)
+            let models = try await ModelCatalog.antigravity(auth: auth, session: session, backend: TranslatorTests.Antigravity.backend)
 
             #expect(models == [
                 RemoteModel(id: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6"),
                 RemoteModel(id: "gemini-3-flash", displayName: "Gemini 3 Flash"),
+                RemoteModel(id: "gemini-3.1-pro-low", displayName: "Gemini 3.1 Pro (Low)"),
             ])
             let sent = StubURLProtocol.requests.map(\.request)
             #expect(sent.map { $0.url?.absoluteString } == [
+                "https://prod.example.com/v1internal:loadCodeAssist",
                 "https://daily.example.com/v1internal:fetchAvailableModels",
-                "https://prod.example.com/v1internal:fetchAvailableModels",
+                "https://daily.example.com/v1internal:fetchAvailableModels",
             ])
-            #expect(sent.last?.httpMethod == "POST")
-            #expect(try StubURLProtocol.bodyJSON(1)["project"] as? String == "proj-1")
+            #expect(sent.last?.value(forHTTPHeaderField: "User-Agent")?.hasPrefix("antigravity/hub/9.9.9") == true)
+            #expect(try StubURLProtocol.bodyJSON(1)["entitlement"] as? [String: String] == ["userTier": "g1-pro-tier"])
+            let accepted = try StubURLProtocol.bodyJSON(2)
+            #expect(accepted["project"] as? String == "proj-1")
+            #expect(accepted["entitlement"] as? [String: String] == ["userTier": "standard-tier"])
+        }
+
+        @Test func antigravityFreeTierNamesNoEntitlement() async throws {
+            let session = StubURLProtocol.session([
+                .init(status: 200, body: #"{"cloudaicompanionProject":"proj-1","currentTier":{"id":"free-tier"}}"#),
+                .init(status: 200, body: #"{"models":{}}"#),
+            ])
+            let auth = OAuthSession(provider: .antigravity, store: MemoryCredentialStore(TranslatorTests.freshTokens), session: session)
+
+            let models = try await ModelCatalog.antigravity(auth: auth, session: session, backend: TranslatorTests.Antigravity.backend)
+
+            #expect(try StubURLProtocol.bodyJSON(1)["entitlement"] == nil)
+            // Nothing listed: Antigravity's usual models are offered instead.
+            #expect(models.map(\.id).contains("gemini-3-flash"))
         }
     }
 }
