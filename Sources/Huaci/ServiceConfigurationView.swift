@@ -68,7 +68,7 @@ private struct PersonalAPIForm: View {
         }
         Text("支持 OpenAI 兼容的 Chat Completions 接口。API Key 只保存在本机钥匙串，并且只发送到上面的服务地址。")
             .font(.caption).foregroundStyle(.secondary)
-            .onAppear { hasSavedKey = model.keychain.read(.personalAPIKey) != nil }
+            .onAppear { hasSavedKey = model.keychain.contains(.personalAPIKey) }
     }
 
     private func save() {

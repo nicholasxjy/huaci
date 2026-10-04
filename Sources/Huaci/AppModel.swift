@@ -112,7 +112,7 @@ final class AppModel: ObservableObject {
     /// Whether the service has credentials; the menu marks the others.
     func isConfigured(_ service: TranslationService) -> Bool {
         switch service {
-        case .personalAPI: return keychain.read(.personalAPIKey) != nil && !settings.personalModel.isEmpty
+        case .personalAPI: return keychain.contains(.personalAPIKey) && !settings.personalModel.isEmpty
         case .chatGPT, .antigravity: return accounts[service] != nil
         }
     }

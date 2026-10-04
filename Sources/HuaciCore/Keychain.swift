@@ -24,6 +24,17 @@ public struct Keychain: Sendable {
         return String(data: data, encoding: .utf8)
     }
 
+    /// Whether the item exists. Reads attributes only, so unlike `read` it
+    /// never shows the keychain access prompt (which a rebuilt, re-signed app
+    /// triggers) — safe to call while a menu is tracking and holds the keyboard.
+    public func contains(_ key: Key) -> Bool {
+        var query = baseQuery(key)
+        query[kSecReturnAttributes as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        return SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess
+    }
+
     /// Stores the value; an empty value deletes the item.
     @discardableResult
     public func write(_ value: String, for key: Key) -> Bool {
