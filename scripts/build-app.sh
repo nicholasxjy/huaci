@@ -5,13 +5,13 @@
 #   UNIVERSAL=1        Build for both arm64 and x86_64.
 #   SIGN_IDENTITY      "Developer ID Application: …" for distribution; ad-hoc when unset.
 #   NOTARY_PROFILE     notarytool keychain profile; notarizes and staples when set (needs SIGN_IDENTITY).
-#   VERSION            CFBundleShortVersionString (default 0.1.0).
+#   VERSION            CFBundleShortVersionString (default 0.0.2).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 APP="$ROOT/build/Huaci.app"
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-0.0.2}"
 BUILD_NUMBER="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 
 if [[ -z "${DEVELOPER_DIR:-}" && -d /Applications/Xcode.app ]]; then
@@ -29,6 +29,7 @@ BIN_DIR="$(swift build -c release ${ARCH_FLAGS[@]+"${ARCH_FLAGS[@]}"} --show-bin
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/Huaci" "$APP/Contents/MacOS/Huaci"
+cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -41,6 +42,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>划词</string>
   <key>CFBundleDisplayName</key><string>划词</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
   <key>CFBundleVersion</key><string>${BUILD_NUMBER}</string>

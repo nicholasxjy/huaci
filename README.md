@@ -11,7 +11,8 @@ macOS 菜单栏划词翻译：在任意应用中选中文字，按快捷键（�
 | `Sources/HuaciCore` | 取词（辅助功能 + 剪贴板回退与恢复）、语言判断、提示词与结果解析、OpenAI 兼容客户端、SQLite 历史/生词、Keychain |
 | `Sources/Huaci` | 菜单栏应用：全局快捷键、翻译浮窗、设置、首次引导、历史与生词本 |
 | `Tests/HuaciCoreTests` | 单元测试 |
-| `scripts` | 打包脚本 |
+| `Resources` | App 图标（1024px PNG 预览与包含标准 / Retina 尺寸的 ICNS） |
+| `scripts` | 打包脚本与图标生成脚本 |
 
 ## 客户端
 
@@ -24,8 +25,16 @@ swift test                       # 单元测试
 open build/Huaci.app
 ```
 
+App 图标以选中的英文字母和中文翻译气泡表达“划词翻译”。打包时会自动复制 `Resources/AppIcon.icns` 并设置应用图标；修改矢量绘图源 `scripts/generate-icons.swift` 后，可重新生成全部尺寸，再打包：
+
+```sh
+swift scripts/generate-icons.swift
+./scripts/build-app.sh
+```
+
 打包参数（环境变量）：
 
+- `VERSION`：应用版本号，默认 `0.0.2`。
 - `UNIVERSAL=1`：同时构建 arm64 与 x86_64。
 - `SIGN_IDENTITY`：Developer ID 证书名称，启用 Hardened Runtime 签名；不设置时为 ad-hoc 签名。
 - `NOTARY_PROFILE`：`xcrun notarytool store-credentials` 保存的配置名；设置后自动公证并装订。
