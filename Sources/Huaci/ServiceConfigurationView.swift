@@ -49,7 +49,8 @@ private struct PersonalAPIForm: View {
     var body: some View {
         TextField("服务地址", text: $settings.personalBaseURL, prompt: Text("https://api.openai.com/v1"))
         SecureField("API Key", text: $apiKey, prompt: Text(hasSavedKey ? "已保存；输入新 Key 可替换" : "sk-…"))
-        TextField("模型", text: $settings.personalModel, prompt: Text("例如 gpt-4o-mini"))
+        ModelPicker(service: .personalAPI, model: $settings.personalModel, prompt: "例如 gpt-4o-mini",
+                    canFetch: hasSavedKey && !settings.personalBaseURL.isEmpty)
 
         HStack {
             Button("保存") { save() }.disabled(apiKey.isEmpty)
@@ -128,15 +129,8 @@ private struct OAuthServiceForm: View {
         }
         // Frees the callback port when the form goes away mid sign-in.
         .onDisappear { signInTask?.cancel() }
-        HStack {
-            TextField("模型", text: $model, prompt: Text(service.suggestedModels.first ?? ""))
-            Menu("常用") {
-                ForEach(service.suggestedModels, id: \.self) { name in
-                    Button(name) { model = name }
-                }
-            }
-            .fixedSize()
-        }
+        ModelPicker(service: service, model: $model, prompt: service.suggestedModels.first ?? "",
+                    canFetch: appModel.accounts[service] != nil)
         HStack {
             Button("测试连接") {
                 Task {
@@ -175,6 +169,72 @@ private struct OAuthServiceForm: View {
                 failed = true
             }
             signInTask = nil
+        }
+    }
+}
+
+/// Model name field with a menu of the models the service offers. The list is
+/// fetched once credentials are available (on open, after saving a key or
+/// signing in); until then the suggested names are offered. Names can still be
+/// typed by hand.
+private struct ModelPicker: View {
+    let service: TranslationService
+    @Binding var model: String
+    let prompt: String
+    let canFetch: Bool
+
+    @EnvironmentObject private var appModel: AppModel
+    @State private var loading = false
+    @State private var error: String?
+
+    private var fetched: [RemoteModel]? { appModel.remoteModels[service] }
+    private var choices: [RemoteModel] { fetched ?? service.suggestedModels.map { RemoteModel(id: $0) } }
+
+    var body: some View {
+        HStack {
+            TextField("模型", text: $model, prompt: Text(prompt))
+            Menu("选择") {
+                ForEach(choices) { choice in
+                    Button { model = choice.id } label: {
+                        if choice.id == model {
+                            Label(choice.displayName ?? choice.id, systemImage: "checkmark")
+                        } else {
+                            Text(choice.displayName ?? choice.id)
+                        }
+                    }
+                }
+            }
+            .fixedSize()
+            .disabled(choices.isEmpty)
+            if loading {
+                ProgressView().controlSize(.small)
+            } else {
+                Button { Task { await fetch() } } label: { Image(systemName: "arrow.clockwise") }
+                    .help("从服务器获取模型列表")
+                    .disabled(!canFetch)
+            }
+        }
+        .task(id: canFetch) {
+            if canFetch && fetched == nil { await fetch() }
+        }
+        if let error {
+            Text("获取模型列表失败：\(error)").font(.caption).foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if let fetched, !model.isEmpty, !fetched.contains(where: { $0.id == model }) {
+            Text("当前模型不在服务器返回的列表中，可能无法使用。").font(.caption).foregroundStyle(.orange)
+        }
+    }
+
+    private func fetch() async {
+        loading = true
+        defer { loading = false }
+        do {
+            try await appModel.fetchModels(for: service)
+            error = nil
+        } catch TranslationError.cancelled {
+            // The form went away mid-request.
+        } catch {
+            self.error = (error as? TranslationError)?.userMessage ?? error.localizedDescription
         }
     }
 }

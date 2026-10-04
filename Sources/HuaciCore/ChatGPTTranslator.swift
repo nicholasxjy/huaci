@@ -5,6 +5,8 @@ import Foundation
 public enum ChatGPTAuth {
     public static let clientID = "app_EMoamEEZ73f0CkXaXp7hrann"
     public static let originator = "codex_cli_rs"
+    /// Codex CLI version reported to the model list endpoint.
+    public static let clientVersion = "0.160.0"
 
     static func accountID(fromIDToken token: String) -> String? {
         guard let claims = JWT.claims(token) else { return nil }
@@ -45,6 +47,7 @@ extension OAuthProvider {
 /// so the server-sent events are collected before parsing.
 public final class ChatGPTTranslator: Translator {
     public static let endpoint = URL(string: "https://chatgpt.com/backend-api/codex/responses")!
+    public static let modelsEndpoint = URL(string: "https://chatgpt.com/backend-api/codex/models")!
 
     private let auth: OAuthSession
     private let model: String

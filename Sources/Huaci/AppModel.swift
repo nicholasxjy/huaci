@@ -19,6 +19,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var storeError: String?
     /// Signed-in OAuth accounts, for display.
     @Published private(set) var accounts: [TranslationService: OAuthTokens] = [:]
+    /// Models fetched from each service this run, offered in settings.
+    @Published private(set) var remoteModels: [TranslationService: [RemoteModel]] = [:]
 
     private(set) var flow: TranslationFlow!
     private(set) var popup: PopupController!
@@ -129,7 +131,22 @@ final class AppModel: ObservableObject {
 
     func signOut(_ service: TranslationService) async {
         await auth(for: service)?.signOut()
+        remoteModels[service] = nil
         refreshAccounts()
+    }
+
+    /// Asks the service which models it offers and keeps the list for settings.
+    func fetchModels(for service: TranslationService) async throws {
+        let models: [RemoteModel]
+        switch service {
+        case .personalAPI:
+            models = try await ModelCatalog.personalAPI(baseURL: settings.personalBaseURL, apiKey: keychain.read(.personalAPIKey) ?? "")
+        case .chatGPT:
+            models = try await ModelCatalog.chatGPT(auth: chatGPTAuth)
+        case .antigravity:
+            models = try await ModelCatalog.antigravity(auth: antigravityAuth)
+        }
+        remoteModels[service] = models
     }
 
     private func refreshAccounts() {
