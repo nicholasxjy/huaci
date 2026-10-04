@@ -5,7 +5,7 @@
 #   UNIVERSAL=1        Build for both arm64 and x86_64.
 #   SIGN_IDENTITY      "Developer ID Application: …" for distribution; ad-hoc when unset.
 #   NOTARY_PROFILE     notarytool keychain profile; notarizes and staples when set (needs SIGN_IDENTITY).
-#   VERSION            CFBundleShortVersionString (default 0.0.4).
+#   VERSION            CFBundleShortVersionString (default 0.0.5).
 #   ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_CLIENT_SECRET
 #                      Antigravity OAuth client, written into Info.plist. Also read
 #                      from the gitignored secrets.env; Antigravity login is
@@ -21,7 +21,7 @@ if [[ -f "$ROOT/secrets.env" ]]; then
   set +a
 fi
 APP="$ROOT/build/Huaci.app"
-VERSION="${VERSION:-0.0.4}"
+VERSION="${VERSION:-0.0.5}"
 BUILD_NUMBER="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 
 if [[ -z "${DEVELOPER_DIR:-}" && -d /Applications/Xcode.app ]]; then
