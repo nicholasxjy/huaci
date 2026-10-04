@@ -113,3 +113,30 @@ public struct TranslationResult: Codable, Equatable, Sendable {
         self.word = word
     }
 }
+
+/// Where translations are sent. Each service keeps its own credentials, so
+/// switching does not require signing in again.
+public enum TranslationService: String, CaseIterable, Identifiable, Sendable {
+    case personalAPI
+    case chatGPT
+    case antigravity
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .personalAPI: return "个人 API（OpenAI 兼容）"
+        case .chatGPT: return "ChatGPT 账号"
+        case .antigravity: return "Antigravity（Google 账号）"
+        }
+    }
+
+    /// Suggested models; the first is the default.
+    public var suggestedModels: [String] {
+        switch self {
+        case .personalAPI: return []
+        case .chatGPT: return ["gpt-5.4-mini", "gpt-5.4", "gpt-5.5"]
+        case .antigravity: return ["gemini-3-flash", "gemini-3.1-pro-low", "claude-sonnet-4-6"]
+        }
+    }
+}

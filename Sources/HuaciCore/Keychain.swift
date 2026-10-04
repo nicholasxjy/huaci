@@ -1,10 +1,12 @@
 import Foundation
 import Security
 
-/// Generic-password items in the login keychain for the API key.
+/// Generic-password items in the login keychain for the API key and OAuth tokens.
 public struct Keychain: Sendable {
     public enum Key: String, Sendable {
         case personalAPIKey = "personal-api-key"
+        case chatGPTOAuth = "chatgpt-oauth"
+        case antigravityOAuth = "antigravity-oauth"
     }
 
     public let service: String

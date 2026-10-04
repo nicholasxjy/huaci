@@ -7,7 +7,7 @@ struct SettingsView: View {
         TabView {
             Form { ServiceConfigurationView() }
                 .formStyle(.grouped)
-                .tabItem { Label("翻译 API", systemImage: "network") }
+                .tabItem { Label("翻译服务", systemImage: "network") }
             LanguageSettings()
                 .tabItem { Label("语言", systemImage: "globe") }
             GeneralSettings()

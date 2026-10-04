@@ -132,7 +132,7 @@ struct PopupView: View {
 
     private func isRetryable(_ error: TranslationError) -> Bool {
         switch error {
-        case .network, .timeout, .invalidResponse, .http, .rateLimited: return true
+        case .network, .timeout, .invalidResponse, .http, .rejected, .rateLimited: return true
         default: return false
         }
     }

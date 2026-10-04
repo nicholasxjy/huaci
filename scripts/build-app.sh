@@ -6,10 +6,20 @@
 #   SIGN_IDENTITY      "Developer ID Application: …" for distribution; ad-hoc when unset.
 #   NOTARY_PROFILE     notarytool keychain profile; notarizes and staples when set (needs SIGN_IDENTITY).
 #   VERSION            CFBundleShortVersionString (default 0.0.2).
+#   ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_CLIENT_SECRET
+#                      Antigravity OAuth client, written into Info.plist. Also read
+#                      from the gitignored secrets.env; Antigravity login is
+#                      unavailable when unset.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
+if [[ -f "$ROOT/secrets.env" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$ROOT/secrets.env"
+  set +a
+fi
 APP="$ROOT/build/Huaci.app"
 VERSION="${VERSION:-0.0.2}"
 BUILD_NUMBER="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
@@ -52,6 +62,13 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+if [[ -n "${ANTIGRAVITY_CLIENT_ID:-}" && -n "${ANTIGRAVITY_CLIENT_SECRET:-}" ]]; then
+  plutil -insert HuaciAntigravityClientID -string "$ANTIGRAVITY_CLIENT_ID" "$APP/Contents/Info.plist"
+  plutil -insert HuaciAntigravityClientSecret -string "$ANTIGRAVITY_CLIENT_SECRET" "$APP/Contents/Info.plist"
+else
+  echo "warning: ANTIGRAVITY_CLIENT_ID/ANTIGRAVITY_CLIENT_SECRET not set; Antigravity login will be unavailable" >&2
+fi
 
 if [[ -n "${SIGN_IDENTITY:-}" ]]; then
   codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
