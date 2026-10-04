@@ -42,7 +42,7 @@ swift scripts/generate-icons.swift
 
 打包参数（环境变量）：
 
-- `VERSION`：应用版本号，默认 `0.0.2`。
+- `VERSION`：应用版本号，默认 `0.0.3`。
 - `UNIVERSAL=1`：同时构建 arm64 与 x86_64。
 - `SIGN_IDENTITY`：Developer ID 证书名称，启用 Hardened Runtime 签名；不设置时为 ad-hoc 签名。
 - `NOTARY_PROFILE`：`xcrun notarytool store-credentials` 保存的配置名；设置后自动公证并装订。
