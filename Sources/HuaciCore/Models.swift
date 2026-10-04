@@ -135,7 +135,7 @@ public enum TranslationService: String, CaseIterable, Identifiable, Sendable {
     public var suggestedModels: [String] {
         switch self {
         case .personalAPI: return []
-        case .chatGPT: return ["gpt-5.4-mini", "gpt-5.4", "gpt-5.5"]
+        case .chatGPT: return ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"]
         case .antigravity: return ["gemini-3-flash", "gemini-3.1-pro-low", "claude-sonnet-4-6"]
         }
     }

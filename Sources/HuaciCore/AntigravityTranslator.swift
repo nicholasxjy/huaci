@@ -142,30 +142,38 @@ public final class AntigravityTranslator: Translator {
             "generationConfig": generationConfig,
         ]
 
+        let model = model
+        return try await Self.firstReachable(endpoints) { endpoint in
+            let url = endpoint.appendingPathComponent("v1internal:generateContent")
+            let data = try await auth.send(session: session) { tokens in
+                let body: [String: Any] = [
+                    "project": tokens.projectID ?? AntigravityAuth.fallbackProjectID,
+                    "model": model,
+                    "request": inner,
+                    "requestType": "agent",
+                    "userAgent": "antigravity",
+                    "requestId": "agent-\(UUID().uuidString.lowercased())",
+                ]
+                var urlRequest = URLRequest(url: url, timeoutInterval: 60)
+                urlRequest.httpMethod = "POST"
+                urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                urlRequest.setValue("Bearer \(tokens.accessToken)", forHTTPHeaderField: "Authorization")
+                urlRequest.setValue(AntigravityAuth.userAgent, forHTTPHeaderField: "User-Agent")
+                urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
+                return urlRequest
+            }
+            return try ResultParser.parse(try Self.outputText(data), for: request)
+        }
+    }
+
+    /// Runs `body` against each endpoint in turn, moving on after errors the
+    /// next endpoint may not have; the last endpoint's error is reported.
+    static func firstReachable<T>(_ endpoints: [URL], _ body: (URL) async throws -> T) async throws -> T {
         var lastError: Error = TranslationError.invalidResponse
         for (index, endpoint) in endpoints.enumerated() {
-            let url = endpoint.appendingPathComponent("v1internal:generateContent")
-            let model = model
             do {
-                let data = try await auth.send(session: session) { tokens in
-                    let body: [String: Any] = [
-                        "project": tokens.projectID ?? AntigravityAuth.fallbackProjectID,
-                        "model": model,
-                        "request": inner,
-                        "requestType": "agent",
-                        "userAgent": "antigravity",
-                        "requestId": "agent-\(UUID().uuidString.lowercased())",
-                    ]
-                    var urlRequest = URLRequest(url: url, timeoutInterval: 60)
-                    urlRequest.httpMethod = "POST"
-                    urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    urlRequest.setValue("Bearer \(tokens.accessToken)", forHTTPHeaderField: "Authorization")
-                    urlRequest.setValue(AntigravityAuth.userAgent, forHTTPHeaderField: "User-Agent")
-                    urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
-                    return urlRequest
-                }
-                return try ResultParser.parse(try Self.outputText(data), for: request)
-            } catch let error as TranslationError where index < endpoints.count - 1 && Self.shouldTryNextEndpoint(error) {
+                return try await body(endpoint)
+            } catch let error as TranslationError where index < endpoints.count - 1 && shouldTryNextEndpoint(error) {
                 lastError = error
             }
         }
