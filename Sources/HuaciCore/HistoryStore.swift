@@ -15,12 +15,22 @@ public struct FavoriteItem: Identifiable, Equatable, Sendable {
     public var headword: String { result.word?.headword ?? result.sourceText }
 }
 
+public struct CachedTranslation: Identifiable, Equatable, Sendable {
+    public let id: Int64
+    public let result: TranslationResult
+    /// When the model produced this result.
+    public let createdAt: Date
+}
+
 public enum StoreError: Error, Equatable {
     case sqlite(String)
 }
 
-/// Local SQLite store for query history and saved words. Data stays on this Mac.
+/// Local SQLite store for query history, saved words and cached translations.
+/// Data stays on this Mac.
 public final class HistoryStore: @unchecked Sendable {
+    /// The database file; history, favorites and the translation cache share it.
+    public let url: URL
     private var db: OpaquePointer?
     private let lock = NSLock()
     private let encoder = JSONEncoder()
@@ -34,6 +44,7 @@ public final class HistoryStore: @unchecked Sendable {
     }
 
     public init(url: URL) throws {
+        self.url = url
         guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
             let message = db.map { String(cString: sqlite3_errmsg($0)) } ?? "open failed"
             sqlite3_close(db)
@@ -125,6 +136,44 @@ public final class HistoryStore: @unchecked Sendable {
         }
     }
 
+    // MARK: Translation cache
+
+    /// Translations keyed by the exact request text, kind and target language,
+    /// so a repeated lookup does not call the model again.
+    public func cachedResult(for request: TranslationRequest) throws -> TranslationResult? {
+        try query(
+            "SELECT payload FROM translation_cache WHERE source_text = ? AND kind = ? AND target_language = ?",
+            [.text(request.text), .text(request.kind.rawValue), .text(request.targetLanguage.code)]
+        ) { row in try? self.decode(row.text(0)) }.first
+    }
+
+    public func cache(_ result: TranslationResult, for request: TranslationRequest, at date: Date = Date()) throws {
+        try write(
+            """
+            INSERT INTO translation_cache (source_text, kind, target_language, payload, created_at) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(source_text, kind, target_language) DO UPDATE SET payload = excluded.payload, created_at = excluded.created_at
+            """,
+            [.text(request.text), .text(request.kind.rawValue), .text(request.targetLanguage.code), .text(try encode(result)),
+             .real(date.timeIntervalSince1970)]
+        )
+    }
+
+    public func cachedTranslations(limit: Int = 500) throws -> [CachedTranslation] {
+        try query("SELECT rowid, payload, created_at FROM translation_cache ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                  [.int(Int64(limit))]) { row in
+            guard let result = try? self.decode(row.text(1)) else { return nil }
+            return CachedTranslation(id: row.int(0), result: result, createdAt: Date(timeIntervalSince1970: row.real(2)))
+        }
+    }
+
+    public func translationCacheCount() throws -> Int {
+        Int(try query("SELECT COUNT(*) FROM translation_cache", []) { $0.int(0) }.first ?? 0)
+    }
+
+    public func clearTranslationCache() throws {
+        try write("DELETE FROM translation_cache", [])
+    }
+
     // MARK: - SQLite plumbing
 
     enum Value {
@@ -165,6 +214,19 @@ public final class HistoryStore: @unchecked Sendable {
                 UNIQUE(headword, target_language)
             );
             PRAGMA user_version = 1;
+            """)
+        }
+        if version < 2 {
+            try exec("""
+            CREATE TABLE IF NOT EXISTS translation_cache (
+                source_text TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                target_language TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (source_text, kind, target_language)
+            );
+            PRAGMA user_version = 2;
             """)
         }
     }
@@ -236,3 +298,5 @@ public final class HistoryStore: @unchecked Sendable {
         return "%\(escaped)%"
     }
 }
+
+extension HistoryStore: TranslationCache {}

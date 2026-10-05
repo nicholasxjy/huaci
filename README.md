@@ -16,7 +16,7 @@ macOS 菜单栏划词翻译：在任意应用中选中文字，按快捷键（�
 
 | 路径 | 内容 |
 | --- | --- |
-| `Sources/HuaciCore` | 取词（辅助功能 + 剪贴板回退与恢复）、语言判断、提示词与结果解析、OpenAI 兼容 / ChatGPT / Antigravity 客户端、OAuth（PKCE + 本机回调）、SQLite 历史/生词、Keychain |
+| `Sources/HuaciCore` | 取词（辅助功能 + 剪贴板回退与恢复）、语言判断、提示词与结果解析、OpenAI 兼容 / ChatGPT / Antigravity 客户端、OAuth（PKCE + 本机回调）、SQLite 历史/生词/翻译缓存、Keychain |
 | `Sources/Huaci` | 菜单栏应用：全局快捷键、翻译浮窗、设置、首次引导、历史与生词本 |
 | `Tests/HuaciCoreTests` | 单元测试 |
 | `Resources` | App 图标（1024px PNG 预览与包含标准 / Retina 尺寸的 ICNS） |
@@ -55,7 +55,7 @@ swift scripts/generate-icons.swift
 - ad-hoc 签名每次重新构建签名都会变化，需要在系统设置中把“划词”的辅助功能权限关掉再打开（或移除后重新添加）；钥匙串也可能再次询问访问权限。使用 Developer ID 签名后不会出现这个问题。
 - 取词优先读取辅助功能选区，不改动剪贴板；读不到时发送 ⌘C，只在剪贴板确实发生变化时使用复制结果，并且仅当剪贴板仍是这次复制的内容时恢复原内容（包括多条目、多类型数据）。
 - 网络代理：OAuth 令牌请求和所有翻译请求都使用系统代理设置（系统设置 › 网络 › 代理，包括自动代理配置）。浏览器登录页由浏览器自身的代理设置决定；登录回调访问的是本机 `localhost`，不经过代理。
-- 历史与生词保存在 `~/Library/Application Support/Huaci/huaci.sqlite`；API Key 与 OAuth 令牌保存在登录钥匙串（服务名 `app.huaci.Huaci`，账户名分别为 `personal-api-key`、`chatgpt-oauth`、`antigravity-oauth`）。
+- 历史、生词与翻译缓存保存在 `~/Library/Application Support/Huaci/huaci.sqlite`；相同原文、类型与目标语言再次查询时直接使用缓存结果，不再请求模型（切换服务或模型不会使缓存失效，可在“设置 › 缓存”中查看与一键清除）；API Key 与 OAuth 令牌保存在登录钥匙串（服务名 `app.huaci.Huaci`，账户名分别为 `personal-api-key`、`chatgpt-oauth`、`antigravity-oauth`）。
 
 ## 尚需人工验证
 

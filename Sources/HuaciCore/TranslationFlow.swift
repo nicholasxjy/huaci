@@ -22,6 +22,12 @@ public protocol TranslationPresenter: AnyObject {
     func show(error: FlowError, requestID: UUID)
 }
 
+/// Stored translations checked before calling the model.
+public protocol TranslationCache: AnyObject {
+    func cachedResult(for request: TranslationRequest) throws -> TranslationResult?
+    func cache(_ result: TranslationResult, for request: TranslationRequest, at date: Date) throws
+}
+
 /// One hotkey press: capture → analyze → translate → present. The newest
 /// request always wins; older results are dropped instead of overwriting it.
 @MainActor
@@ -31,6 +37,7 @@ public final class TranslationFlow {
     private let capture: Capture
     private let rules: () -> LanguageRules
     private let makeTranslator: () throws -> Translator
+    private let cache: TranslationCache?
     private let onSuccess: (TranslationResult) -> Void
     public weak var presenter: TranslationPresenter?
 
@@ -41,10 +48,12 @@ public final class TranslationFlow {
     public init(capture: @escaping Capture,
                 rules: @escaping () -> LanguageRules,
                 makeTranslator: @escaping () throws -> Translator,
+                cache: TranslationCache? = nil,
                 onSuccess: @escaping (TranslationResult) -> Void) {
         self.capture = capture
         self.rules = rules
         self.makeTranslator = makeTranslator
+        self.cache = cache
         self.onSuccess = onSuccess
     }
 
@@ -109,8 +118,15 @@ public final class TranslationFlow {
             sourceLanguage: analysis.sourceLanguage,
             targetLanguage: LanguageOption.named(analysis.targetLanguage)
         )
+        // Cache failures fall through to the model; they never block a lookup.
+        if let cached = try? cache?.cachedResult(for: request) {
+            onSuccess(cached)
+            presenter?.show(result: cached, requestID: id)
+            return
+        }
         do {
             let result = try await makeTranslator().translate(request)
+            try? cache?.cache(result, for: request, at: Date())
             guard isCurrent(id) else { return }
             onSuccess(result)
             presenter?.show(result: result, requestID: id)
