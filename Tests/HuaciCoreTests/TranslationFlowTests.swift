@@ -59,13 +59,21 @@ struct TranslationFlowTests {
         try? await Task.sleep(nanoseconds: 20_000_000)
     }
 
-    func makeFlow(captures: [CaptureOutcome], translator: Translator, saved: @escaping (TranslationResult) -> Void = { _ in })
+    func makeFlow(captures: [CaptureOutcome], translator: Translator, cache: TranslationCache? = nil,
+                  saved: @escaping (TranslationResult) -> Void = { _ in })
+        -> (TranslationFlow, RecordingPresenter) {
+        makeFlow(captures: captures, makeTranslator: { translator }, cache: cache, saved: saved)
+    }
+
+    func makeFlow(captures: [CaptureOutcome], makeTranslator: @escaping () throws -> Translator, cache: TranslationCache? = nil,
+                  saved: @escaping (TranslationResult) -> Void = { _ in })
         -> (TranslationFlow, RecordingPresenter) {
         var queue = captures
         let flow = TranslationFlow(
             capture: { _ in queue.removeFirst() },
             rules: { LanguageRules() },
-            makeTranslator: { translator },
+            makeTranslator: makeTranslator,
+            cache: cache,
             onSuccess: saved
         )
         let presenter = RecordingPresenter()
@@ -166,5 +174,63 @@ struct TranslationFlowTests {
         let id = flow.trigger(frontmostPID: 1)
         await settle()
         #expect(spy.ids == [id])
+    }
+
+    @Test func cacheHitIsShownAndSavedWithoutCallingModel() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("huaci-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try HistoryStore(url: url)
+        let cached = TranslationRequest(text: "Some sentence, here.", kind: .text, sourceLanguage: "en", targetLanguage: .named("zh-Hans"))
+        try store.cache(TranslationResult(kind: .text, sourceText: cached.text, sourceLanguage: "en", targetLanguage: "zh-Hans",
+                                          translation: "缓存的译文", word: nil), for: cached)
+        var saved: [String] = []
+        // Not configured: a cache hit must not need a translator at all.
+        let (flow, presenter) = makeFlow(captures: [.success(text: "Some sentence, here.", method: .copy)],
+                                         makeTranslator: { throw TranslationError.notConfigured("x") },
+                                         cache: store, saved: { saved.append($0.translation) })
+
+        let id = flow.trigger(frontmostPID: 1)
+        await settle()
+
+        #expect(presenter.events == [.loading(id, "Some sentence, here."), .result(id, "缓存的译文")])
+        #expect(saved == ["缓存的译文"])
+    }
+
+    @Test func cacheMissTranslatesThenServesNextLookupFromCache() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("huaci-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try HistoryStore(url: url)
+        let translator = ControlledTranslator()
+        translator.release("Some sentence, here.")
+        var calls = 0
+        let (flow, presenter) = makeFlow(captures: [.success(text: "Some sentence, here.", method: .copy),
+                                                    .success(text: "Some sentence, here.", method: .copy)],
+                                         makeTranslator: { calls += 1; return translator }, cache: store)
+
+        let first = flow.trigger(frontmostPID: 1)
+        await settle()
+        let second = flow.trigger(frontmostPID: 1)
+        await settle()
+
+        #expect(presenter.results == [.result(first, "译:Some sentence, here."), .result(second, "译:Some sentence, here.")])
+        #expect(calls == 1)
+    }
+
+    @Test func failedTranslationIsNotCached() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("huaci-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try HistoryStore(url: url)
+        let translator = ControlledTranslator()
+        translator.failure = .timeout
+        translator.release("Some sentence, here.")
+        let (flow, presenter) = makeFlow(captures: [.success(text: "Some sentence, here.", method: .copy)],
+                                         translator: translator, cache: store)
+
+        let id = flow.trigger(frontmostPID: 1)
+        await settle()
+
+        #expect(presenter.events.last == .error(id, .translation(.timeout)))
+        let request = TranslationRequest(text: "Some sentence, here.", kind: .text, sourceLanguage: "en", targetLanguage: .named("zh-Hans"))
+        #expect(try store.cachedResult(for: request) == nil)
     }
 }

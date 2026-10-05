@@ -12,6 +12,8 @@ struct SettingsView: View {
                 .tabItem { Label("语言", systemImage: "globe") }
             GeneralSettings()
                 .tabItem { Label("快捷键与权限", systemImage: "keyboard") }
+            CacheSettings()
+                .tabItem { Label("缓存", systemImage: "internaldrive") }
         }
         .frame(minWidth: 520, minHeight: 420)
     }
@@ -75,5 +77,65 @@ private struct GeneralSettings: View {
         }
         .formStyle(.grouped)
         .onReceive(timer) { _ in model.refreshAccessibility() }
+    }
+}
+
+private struct CacheSettings: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var items: [CachedTranslation] = []
+    @State private var count = 0
+    @State private var confirmClear = false
+
+    var body: some View {
+        Form {
+            Section {
+                LabeledContent("已缓存") { Text("\(count) 条") }
+                if let url = model.store?.url {
+                    LabeledContent("缓存文件") {
+                        HStack {
+                            Text(url.path).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                            Button("在访达中显示") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+                        }
+                    }
+                }
+                HStack {
+                    Spacer()
+                    Button("全部清除", role: .destructive) { confirmClear = true }.disabled(count == 0)
+                }
+            } header: {
+                Text("翻译缓存")
+            } footer: {
+                Text("相同原文、类型与目标语言再次查询时直接使用缓存结果，不再请求模型。切换服务或模型不会使缓存失效；清除后会重新请求模型。缓存与历史、生词本存放在同一个数据库文件中，清除缓存不影响它们。")
+            }
+            Section(count > items.count ? "最近 \(items.count) 条" : "缓存条目") {
+                if items.isEmpty {
+                    Text("暂无缓存").foregroundStyle(.secondary)
+                }
+                ForEach(items) { item in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(item.result.sourceText).lineLimit(1)
+                        Text(item.result.translation).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                        Text("\(LanguageOption.named(item.result.targetLanguage).displayName) · \(item.createdAt.formatted(.dateTime.month().day().hour().minute()))")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            if let error = model.storeError {
+                Text(error).foregroundStyle(.red)
+            }
+        }
+        .formStyle(.grouped)
+        .confirmationDialog("清除全部翻译缓存？", isPresented: $confirmClear) {
+            Button("清除", role: .destructive) { model.clearTranslationCache() }
+        } message: {
+            Text("之后的查询会重新请求模型。查询历史与生词本不受影响。")
+        }
+        .onAppear(perform: reload)
+        .onReceive(model.$dataVersion) { _ in reload() }
+    }
+
+    private func reload() {
+        items = (try? model.store?.cachedTranslations()) ?? []
+        count = (try? model.store?.translationCacheCount()) ?? 0
     }
 }

@@ -44,6 +44,7 @@ final class AppModel: ObservableObject {
                 guard let self else { throw TranslationError.cancelled }
                 return try self.makeTranslator()
             },
+            cache: store,
             onSuccess: { [weak self] result in self?.saveHistory(result) }
         )
         popup = PopupController(model: self)
@@ -197,6 +198,16 @@ final class AppModel: ObservableObject {
             logger.error("Failed to update favorite: \(String(describing: error), privacy: .public)")
         }
         return isFavorite(result)
+    }
+
+    /// Drops stored translations so the next lookups ask the model again.
+    func clearTranslationCache() {
+        do {
+            try store?.clearTranslationCache()
+            dataVersion += 1
+        } catch {
+            logger.error("Failed to clear translation cache: \(String(describing: error), privacy: .public)")
+        }
     }
 
     func dataChanged() {
