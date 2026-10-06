@@ -1,5 +1,6 @@
 import Combine
 import HuaciCore
+import ServiceManagement
 import SwiftUI
 
 struct SettingsView: View {
@@ -11,7 +12,7 @@ struct SettingsView: View {
             LanguageSettings()
                 .tabItem { Label("语言", systemImage: "globe") }
             GeneralSettings()
-                .tabItem { Label("快捷键与权限", systemImage: "keyboard") }
+                .tabItem { Label("通用", systemImage: "gearshape") }
             CacheSettings()
                 .tabItem { Label("缓存", systemImage: "internaldrive") }
         }
@@ -44,8 +45,30 @@ private struct GeneralSettings: View {
     @EnvironmentObject private var settings: AppSettings
     private let timer = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
+    @State private var loginItemStatus = SMAppService.mainApp.status
+    @State private var loginItemError: String?
+
     var body: some View {
         Form {
+            Section {
+                Toggle("开机时自动启动", isOn: Binding(
+                    get: { loginItemStatus == .enabled || loginItemStatus == .requiresApproval },
+                    set: setLaunchAtLogin
+                ))
+                if loginItemStatus == .requiresApproval {
+                    HStack {
+                        Text("需要在系统设置 › 通用 › 登录项中允许划词。").foregroundStyle(.secondary)
+                        Button("打开系统设置") { SMAppService.openSystemSettingsLoginItems() }
+                    }
+                }
+                if let loginItemError {
+                    Text(loginItemError).foregroundStyle(.red)
+                }
+            } header: {
+                Text("启动")
+            } footer: {
+                Text("登录 macOS 后在菜单栏中自动运行。")
+            }
             Section("快捷键") {
                 LabeledContent("翻译选中文字") { ShortcutRecorder() }
             }
@@ -76,7 +99,24 @@ private struct GeneralSettings: View {
             }
         }
         .formStyle(.grouped)
-        .onReceive(timer) { _ in model.refreshAccessibility() }
+        .onReceive(timer) { _ in
+            model.refreshAccessibility()
+            loginItemStatus = SMAppService.mainApp.status
+        }
+    }
+
+    private func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            loginItemError = nil
+        } catch {
+            loginItemError = "无法\(enabled ? "开启" : "关闭")开机启动：\(error.localizedDescription)"
+        }
+        loginItemStatus = SMAppService.mainApp.status
     }
 }
 
