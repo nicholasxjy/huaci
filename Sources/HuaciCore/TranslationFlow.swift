@@ -81,6 +81,18 @@ public final class TranslationFlow {
         return id
     }
 
+    /// Starts a new request from typed text, skipping selection capture.
+    @discardableResult
+    public func translate(text: String) -> UUID {
+        let id = start()
+        guard let analysis = TextAnalyzer.analyze(text, rules: rules()) else {
+            presenter?.show(error: .invalidSelection, requestID: id)
+            return id
+        }
+        task = Task { [weak self] in await self?.translate(analysis, id: id) }
+        return id
+    }
+
     /// Translates the last captured text again, e.g. after an error.
     @discardableResult
     public func retry() -> UUID? {

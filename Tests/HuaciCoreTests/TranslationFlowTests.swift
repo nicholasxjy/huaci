@@ -161,6 +161,43 @@ struct TranslationFlowTests {
         #expect(saved == 1)
     }
 
+    @Test func typedTextIsTranslatedWithoutCapturing() async {
+        let translator = ControlledTranslator()
+        translator.release("Typed sentence, here.")
+        var saved: [String] = []
+        // No queued captures: capturing would crash the test.
+        let (flow, presenter) = makeFlow(captures: [], translator: translator, saved: { saved.append($0.sourceText) })
+
+        let id = flow.translate(text: "  Typed sentence, here.\n")
+        await settle()
+
+        #expect(presenter.events == [.loading(id, "Typed sentence, here."), .result(id, "译:Typed sentence, here.")])
+        #expect(saved == ["Typed sentence, here."])
+    }
+
+    @Test func untranslatableTypedTextIsRejected() async {
+        let (flow, presenter) = makeFlow(captures: [], translator: ControlledTranslator())
+
+        let id = flow.translate(text: "  42 ?! ")
+        await settle()
+
+        #expect(presenter.events == [.error(id, .invalidSelection)])
+    }
+
+    @Test func typedTextReplacesPendingRequest() async {
+        let translator = ControlledTranslator()
+        let (flow, presenter) = makeFlow(captures: [], translator: translator)
+
+        _ = flow.translate(text: "First sentence here.")
+        await settle()
+        let second = flow.translate(text: "Second sentence here.")
+        translator.release("First sentence here.")
+        translator.release("Second sentence here.")
+        await settle()
+
+        #expect(presenter.results == [.result(second, "译:Second sentence here.")])
+    }
+
     @Test func requestIDIsSentToTranslator() async {
         final class Spy: Translator, @unchecked Sendable {
             var ids: [UUID] = []

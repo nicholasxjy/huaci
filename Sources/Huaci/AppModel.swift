@@ -24,6 +24,9 @@ final class AppModel: ObservableObject {
 
     private(set) var flow: TranslationFlow!
     private(set) var popup: PopupController!
+    /// Typed-text translation, separate from the hotkey popup so neither cancels the other.
+    private(set) var inputFlow: TranslationFlow!
+    let inputTranslation = InputTranslationState()
     private let capturer = SelectionCapturer(environment: SystemSelectionEnvironment(), pasteboard: SystemPasteboard())
     private let logger = Logger(subsystem: "app.huaci.Huaci", category: "app")
 
@@ -49,6 +52,18 @@ final class AppModel: ObservableObject {
         )
         popup = PopupController(model: self)
         flow.presenter = popup
+        inputFlow = TranslationFlow(
+            capture: { _ in .failure(.cancelled) },
+            rules: { [weak self] in self?.settings.languageRules ?? LanguageRules() },
+            makeTranslator: { [weak self] in
+                guard let self else { throw TranslationError.cancelled }
+                return try self.makeTranslator()
+            },
+            cache: store,
+            onSuccess: { [weak self] result in self?.saveHistory(result) }
+        )
+        inputTranslation.isFavoriteResult = { [weak self] result in self?.isFavorite(result) ?? false }
+        inputFlow.presenter = inputTranslation
         refreshAccounts()
     }
 
@@ -164,6 +179,18 @@ final class AppModel: ObservableObject {
 
     func cancelTranslation() {
         flow.cancel()
+    }
+
+    func translateInput() {
+        inputFlow.translate(text: inputTranslation.text)
+    }
+
+    func retryInputTranslation() {
+        inputFlow.retry()
+    }
+
+    func cancelInputTranslation() {
+        inputFlow.cancel()
     }
 
     // MARK: History and favorites

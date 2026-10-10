@@ -16,6 +16,13 @@ final class WindowRouter {
         }
     }
 
+    func showInputTranslation() {
+        guard let model else { return }
+        show(id: "input", title: "输入翻译", size: CGSize(width: 520, height: 480)) {
+            InputTranslationView(state: model.inputTranslation).environmentObject(model)
+        }
+    }
+
     func showHistory() {
         guard let model else { return }
         show(id: "history", title: "查询历史", size: CGSize(width: 760, height: 520)) {

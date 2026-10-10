@@ -35,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
 
         menu.addItem(item("翻译选中文字（\(model.settings.shortcut.displayString)）", #selector(translate)))
+        menu.addItem(item("输入翻译…", #selector(showInputTranslation)))
         if let error = model.hotKeyError {
             let warning = NSMenuItem(title: "⚠︎ \(error)", action: nil, keyEquivalent: "")
             warning.isEnabled = false
@@ -100,6 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model.settings.activeService = service
         if !model.isConfigured(service) { WindowRouter.shared.showSettings() }
     }
+    @objc private func showInputTranslation() { WindowRouter.shared.showInputTranslation() }
     @objc private func showHistory() { WindowRouter.shared.showHistory() }
     @objc private func showVocabulary() { WindowRouter.shared.showVocabulary() }
     @objc private func showSettings() { WindowRouter.shared.showSettings() }
