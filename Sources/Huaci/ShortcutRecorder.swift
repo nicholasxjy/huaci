@@ -2,7 +2,7 @@ import AppKit
 import HuaciCore
 import SwiftUI
 
-/// Click, then press a key combination. Esc cancels.
+/// Click, then press a key combination. Esc cancels, ⌫ restores the default.
 struct ShortcutRecorder: View {
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var settings: AppSettings
@@ -11,18 +11,33 @@ struct ShortcutRecorder: View {
     @State private var message: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Button(recording ? "请按下新的快捷键…" : settings.shortcut.displayString) {
-                    recording ? stop(restore: true) : start()
+        VStack(alignment: .trailing, spacing: 6) {
+            Button {
+                recording ? stop(restore: true) : start()
+            } label: {
+                Group {
+                    if recording {
+                        Text("请按下新的快捷键…").font(.system(size: 13)).foregroundStyle(Theme.accent).frame(minWidth: 130)
+                    } else {
+                        KeyCaps(shortcut: settings.shortcut)
+                    }
                 }
-                .frame(minWidth: 140)
-                if settings.shortcut != .defaultShortcut {
-                    Button("恢复默认") { apply(.defaultShortcut) }
-                }
+                .padding(.horizontal, 8)
+                .frame(height: 36)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(recording ? Theme.accent : Color(nsColor: .separatorColor), lineWidth: recording ? 2 : 1)
+                )
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .help(recording ? "按 Esc 取消" : "点击后按下新的组合键")
+            .accessibilityLabel(recording ? "正在录制快捷键" : "快捷键 \(settings.shortcut.displayString)，点击修改")
             if let message = message ?? model.hotKeyError {
-                Text(message).font(.caption).foregroundStyle(.red)
+                Text(message).font(.caption).foregroundStyle(Theme.danger)
+                    .multilineTextAlignment(.trailing)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .onDisappear { stop(restore: true) }
@@ -34,9 +49,16 @@ struct ShortcutRecorder: View {
         // Unregister so pressing the current shortcut is recorded instead of triggering it.
         model.suspendHotKey()
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            if event.keyCode == 53 {
+            switch event.keyCode {
+            case 53:
                 stop(restore: true)
                 return nil
+            case 51:
+                stop(restore: false)
+                apply(.defaultShortcut)
+                return nil
+            default:
+                break
             }
             let shortcut = Shortcut(keyCode: UInt32(event.keyCode), modifiers: Self.modifiers(event.modifierFlags))
             guard shortcut.isValid else {

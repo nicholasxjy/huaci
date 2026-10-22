@@ -21,12 +21,15 @@ final class AppModel: ObservableObject {
     @Published private(set) var accounts: [TranslationService: OAuthTokens] = [:]
     /// Models fetched from each service this run, offered in settings.
     @Published private(set) var remoteModels: [TranslationService: [RemoteModel]] = [:]
+    /// Bumped each time the popup shows a result; onboarding's practice step watches it.
+    @Published private(set) var popupResultCount = 0
 
     private(set) var flow: TranslationFlow!
     private(set) var popup: PopupController!
     /// Typed-text translation, separate from the hotkey popup so neither cancels the other.
     private(set) var inputFlow: TranslationFlow!
     let inputTranslation = InputTranslationState()
+    let mainWindow = MainWindowState()
     private let capturer = SelectionCapturer(environment: SystemSelectionEnvironment(), pasteboard: SystemPasteboard())
     private let logger = Logger(subsystem: "app.huaci.Huaci", category: "app")
 
@@ -111,13 +114,37 @@ final class AppModel: ObservableObject {
         let request = TranslationRequest(text: "hello", kind: .word, sourceLanguage: "en", targetLanguage: .named("zh-Hans"))
         do {
             let result = try await makeTranslator().translate(request)
-            return ("连接成功：hello → \(result.translation)", false)
+            return ("连接正常 · hello → \(result.translation)", false)
         } catch {
             return ((error as? TranslationError)?.userMessage ?? error.localizedDescription, true)
         }
     }
 
     // MARK: Services
+
+    /// Model of the active service, as shown in the popup header.
+    var activeModelName: String {
+        switch settings.activeService {
+        case .personalAPI: return settings.personalModel.isEmpty ? "未设置模型" : settings.personalModel
+        case .chatGPT: return settings.chatGPTModel
+        case .antigravity: return settings.antigravityModel
+        }
+    }
+
+    /// "ChatGPT 账号 · gpt-6-luna"
+    var serviceLine: String {
+        "\(settings.activeService.shortName) · \(activeModelName)"
+    }
+
+    /// Problems that stop lookups from working, most blocking first; shown in
+    /// the menu bar menu.
+    var attentionItems: [AttentionItem] {
+        var items: [AttentionItem] = []
+        if !accessibilityTrusted { items.append(.accessibility) }
+        if let hotKeyError { items.append(.shortcut(hotKeyError)) }
+        if !isConfigured(settings.activeService) { items.append(.service(settings.activeService)) }
+        return items
+    }
 
     func auth(for service: TranslationService) -> OAuthSession? {
         switch service {
@@ -177,12 +204,37 @@ final class AppModel: ObservableObject {
         flow.retry()
     }
 
+    /// Translates the popup's text into another language, for this lookup only.
+    func retargetPopup(_ targetLanguage: String) {
+        flow.retarget(targetLanguage)
+    }
+
     func cancelTranslation() {
         flow.cancel()
     }
 
+    func didShowPopupResult() {
+        popupResultCount += 1
+    }
+
     func translateInput() {
-        inputFlow.translate(text: inputTranslation.text)
+        inputFlow.translate(text: inputTranslation.text, targetLanguage: inputTranslation.targetOverride)
+    }
+
+    /// Shows a popup result in the main window's translate tab for editing.
+    func openInMainWindow(_ result: TranslationResult) {
+        inputFlow.cancel()
+        inputTranslation.text = result.sourceText
+        inputTranslation.show(result: result, requestID: UUID())
+        WindowRouter.shared.showMain(.translate)
+    }
+
+    /// Asks the model again for a stored lookup, bypassing the cache.
+    func retranslate(_ result: TranslationResult) {
+        inputTranslation.text = result.sourceText
+        inputTranslation.targetOverride = result.targetLanguage
+        WindowRouter.shared.showMain(.translate)
+        inputFlow.translate(text: result.sourceText, targetLanguage: result.targetLanguage, useCache: false)
     }
 
     func retryInputTranslation() {
@@ -269,6 +321,49 @@ final class AppModel: ObservableObject {
     }
 
     func refreshAccessibility() {
-        accessibilityTrusted = AXIsProcessTrusted()
+        let trusted = AXIsProcessTrusted()
+        if trusted != accessibilityTrusted { accessibilityTrusted = trusted }
+    }
+}
+
+enum AttentionItem: Equatable {
+    case accessibility
+    case shortcut(String)
+    case service(TranslationService)
+
+    var title: String {
+        switch self {
+        case .accessibility: return "辅助功能权限未开启"
+        case .shortcut: return "快捷键不可用"
+        case .service(let service): return service.usesOAuth ? "\(service.shortName)未登录" : "翻译服务未配置"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .accessibility: return "没有它无法读取选中的文字。"
+        case .shortcut(let error): return error
+        case .service(let service): return "\(service.shortName)还不能使用，翻译会失败。"
+        }
+    }
+
+    var actionTitle: String {
+        switch self {
+        case .accessibility: return "开启权限…"
+        case .shortcut: return "更改快捷键…"
+        case .service(let service): return service.usesOAuth ? "去登录…" : "去设置…"
+        }
+    }
+
+    @MainActor func perform() {
+        switch self {
+        case .accessibility:
+            SystemSelectionEnvironment.requestAccessibilityPrompt()
+            SystemSelectionEnvironment.openAccessibilitySettings()
+        case .shortcut:
+            WindowRouter.shared.showSettings(.general)
+        case .service:
+            WindowRouter.shared.showSettings(.service)
+        }
     }
 }

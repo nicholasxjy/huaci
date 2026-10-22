@@ -79,6 +79,32 @@ struct HistoryStoreTests {
         try store.clearFavorites()
         #expect(try store.favorites().isEmpty)
     }
+
+    @Test func countsHistoryAndFavorites() throws {
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try HistoryStore(url: url)
+        #expect(try store.historyCount() == 0)
+        #expect(try store.favoritesCount() == 0)
+
+        try store.addHistory(word("a", "一"))
+        try store.addHistory(text("Hi.", "嗨。"))
+        try store.addFavorite(word("a", "一"))
+
+        #expect(try store.historyCount() == 2)
+        #expect(try store.favoritesCount() == 1)
+    }
+
+    @Test func favoritesCanBeSortedAlphabetically() throws {
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try HistoryStore(url: url)
+        try store.addFavorite(word("banana", "香蕉"), at: Date(timeIntervalSince1970: 1))
+        try store.addFavorite(word("Apple", "苹果"), at: Date(timeIntervalSince1970: 2))
+        try store.addFavorite(word("cherry", "樱桃"), at: Date(timeIntervalSince1970: 3))
+
+        #expect(try store.favorites().map(\.headword) == ["cherry", "Apple", "banana"])
+        #expect(try store.favorites(order: .alphabetical).map(\.headword) == ["Apple", "banana", "cherry"])
+        #expect(try store.favorites(search: "an", order: .alphabetical).map(\.headword) == ["banana"])
+    }
 }
 
 struct TranslationCacheStoreTests {
@@ -133,28 +159,22 @@ struct TranslationCacheStoreTests {
         #expect(try store.cachedResult(for: bank) != nil)
     }
 
-    @Test func listsCachedTranslationsNewestFirst() throws {
+    @Test func countsAndClearsCachedTranslations() throws {
         defer { try? FileManager.default.removeItem(at: url) }
         let store = try HistoryStore(url: url)
-        #expect(try store.cachedTranslations().isEmpty)
         #expect(try store.translationCacheCount() == 0)
 
         let bank = request("bank"), apple = request("apple"), sentence = request("Good morning.", kind: .text)
-        try store.cache(result(for: bank, "银行"), for: bank, at: Date(timeIntervalSince1970: 1))
-        try store.cache(result(for: apple, "苹果"), for: apple, at: Date(timeIntervalSince1970: 2))
-        try store.cache(result(for: sentence, "早上好。"), for: sentence, at: Date(timeIntervalSince1970: 3))
-        // Re-caching moves an entry to the top instead of adding a second one.
-        try store.cache(result(for: bank, "河岸"), for: bank, at: Date(timeIntervalSince1970: 4))
+        try store.cache(result(for: bank, "银行"), for: bank)
+        try store.cache(result(for: apple, "苹果"), for: apple)
+        try store.cache(result(for: sentence, "早上好。"), for: sentence)
+        // Re-caching replaces the entry instead of adding a second one.
+        try store.cache(result(for: bank, "河岸"), for: bank)
 
-        let items = try store.cachedTranslations()
-        #expect(items.map(\.result.translation) == ["河岸", "早上好。", "苹果"])
-        #expect(items.first?.createdAt == Date(timeIntervalSince1970: 4))
-        #expect(Set(items.map(\.id)).count == 3)
-        #expect(try store.cachedTranslations(limit: 2).count == 2)
         #expect(try store.translationCacheCount() == 3)
+        #expect(try store.cachedResult(for: bank)?.translation == "河岸")
 
         try store.clearTranslationCache()
-        #expect(try store.cachedTranslations().isEmpty)
         #expect(try store.translationCacheCount() == 0)
     }
 

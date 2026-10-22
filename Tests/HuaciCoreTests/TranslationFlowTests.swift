@@ -270,4 +270,64 @@ struct TranslationFlowTests {
         let request = TranslationRequest(text: "Some sentence, here.", kind: .text, sourceLanguage: "en", targetLanguage: .named("zh-Hans"))
         #expect(try store.cachedResult(for: request) == nil)
     }
+    @Test func retargetTranslatesLastTextIntoNewLanguage() async {
+        final class Spy: Translator, @unchecked Sendable {
+            var targets: [String] = []
+            func translate(_ request: TranslationRequest) async throws -> TranslationResult {
+                targets.append(request.targetLanguage.code)
+                return TranslationResult(kind: request.kind, sourceText: request.text, sourceLanguage: request.sourceLanguage,
+                                         targetLanguage: request.targetLanguage.code, translation: "x", word: nil)
+            }
+        }
+        let spy = Spy()
+        let (flow, presenter) = makeFlow(captures: [.success(text: "Some sentence, here.", method: .copy)], translator: spy)
+
+        #expect(flow.retarget("ja") == nil)
+        let first = flow.trigger(frontmostPID: 1)
+        await settle()
+        let second = flow.retarget("ja")
+        await settle()
+
+        #expect(spy.targets == ["zh-Hans", "ja"])
+        #expect(second != nil && second != first)
+        #expect(presenter.events.last == .result(second!, "x"))
+    }
+
+    @Test func typedTextCanOverrideTargetLanguage() async {
+        final class Spy: Translator, @unchecked Sendable {
+            var targets: [String] = []
+            func translate(_ request: TranslationRequest) async throws -> TranslationResult {
+                targets.append(request.targetLanguage.code)
+                return TranslationResult(kind: request.kind, sourceText: request.text, sourceLanguage: nil,
+                                         targetLanguage: request.targetLanguage.code, translation: "x", word: nil)
+            }
+        }
+        let spy = Spy()
+        let (flow, _) = makeFlow(captures: [], translator: spy)
+
+        flow.translate(text: "Some sentence, here.", targetLanguage: "fr")
+        await settle()
+        flow.translate(text: "Some sentence, here.")
+        await settle()
+
+        #expect(spy.targets == ["fr", "zh-Hans"])
+    }
+
+    @Test func bypassingCacheAsksModelAgainAndRefreshesCache() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("huaci-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try HistoryStore(url: url)
+        let request = TranslationRequest(text: "Some sentence, here.", kind: .text, sourceLanguage: "en", targetLanguage: .named("zh-Hans"))
+        try store.cache(TranslationResult(kind: .text, sourceText: request.text, sourceLanguage: "en", targetLanguage: "zh-Hans",
+                                          translation: "旧译文", word: nil), for: request)
+        let translator = ControlledTranslator()
+        translator.release("Some sentence, here.")
+        let (flow, presenter) = makeFlow(captures: [], translator: translator, cache: store)
+
+        let id = flow.translate(text: "Some sentence, here.", useCache: false)
+        await settle()
+
+        #expect(presenter.events.last == .result(id, "译:Some sentence, here."))
+        #expect(try store.cachedResult(for: request)?.translation == "译:Some sentence, here.")
+    }
 }

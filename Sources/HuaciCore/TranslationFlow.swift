@@ -82,14 +82,17 @@ public final class TranslationFlow {
     }
 
     /// Starts a new request from typed text, skipping selection capture.
+    /// `targetLanguage` overrides the language rules for this request;
+    /// `useCache: false` asks the model again and refreshes the cached result.
     @discardableResult
-    public func translate(text: String) -> UUID {
+    public func translate(text: String, targetLanguage: String? = nil, useCache: Bool = true) -> UUID {
         let id = start()
-        guard let analysis = TextAnalyzer.analyze(text, rules: rules()) else {
+        guard var analysis = TextAnalyzer.analyze(text, rules: rules()) else {
             presenter?.show(error: .invalidSelection, requestID: id)
             return id
         }
-        task = Task { [weak self] in await self?.translate(analysis, id: id) }
+        if let targetLanguage { analysis.targetLanguage = targetLanguage }
+        task = Task { [weak self] in await self?.translate(analysis, id: id, useCache: useCache) }
         return id
     }
 
@@ -97,6 +100,16 @@ public final class TranslationFlow {
     @discardableResult
     public func retry() -> UUID? {
         guard let analysis = lastAnalysis else { return nil }
+        let id = start()
+        task = Task { [weak self] in await self?.translate(analysis, id: id) }
+        return id
+    }
+
+    /// Translates the last text into another language, for this request only.
+    @discardableResult
+    public func retarget(_ targetLanguage: String) -> UUID? {
+        guard var analysis = lastAnalysis else { return nil }
+        analysis.targetLanguage = targetLanguage
         let id = start()
         task = Task { [weak self] in await self?.translate(analysis, id: id) }
         return id
@@ -120,7 +133,7 @@ public final class TranslationFlow {
         currentRequestID == id && !Task.isCancelled
     }
 
-    private func translate(_ analysis: TextAnalysis, id: UUID) async {
+    private func translate(_ analysis: TextAnalysis, id: UUID, useCache: Bool = true) async {
         lastAnalysis = analysis
         presenter?.showLoading(requestID: id, sourceText: analysis.text)
         let request = TranslationRequest(
@@ -131,7 +144,7 @@ public final class TranslationFlow {
             targetLanguage: LanguageOption.named(analysis.targetLanguage)
         )
         // Cache failures fall through to the model; they never block a lookup.
-        if let cached = try? cache?.cachedResult(for: request) {
+        if useCache, let cached = try? cache?.cachedResult(for: request) {
             onSuccess(cached)
             presenter?.show(result: cached, requestID: id)
             return
