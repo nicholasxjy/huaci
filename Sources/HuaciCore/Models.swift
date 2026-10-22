@@ -41,6 +41,16 @@ public struct LanguageOption: Hashable, Identifiable, Sendable {
         all.first { $0.code == code }
             ?? LanguageOption(code: code, displayName: code, englishName: code)
     }
+
+    /// Chinese name of a language code for labels such as "英语 → 简体中文";
+    /// nil means the source language was not detected.
+    public static func chineseName(_ code: String?) -> String {
+        guard let code else { return "自动识别" }
+        let names = ["zh": "中文", "zh-Hans": "简体中文", "zh-Hant": "繁体中文", "en": "英语", "ja": "日语", "ko": "韩语",
+                     "fr": "法语", "de": "德语", "es": "西班牙语", "it": "意大利语", "pt": "葡萄牙语", "ru": "俄语"]
+        if let name = names[code] { return name }
+        return Locale(identifier: "zh-Hans").localizedString(forLanguageCode: code) ?? code
+    }
 }
 
 public struct TranslationRequest: Equatable, Sendable {

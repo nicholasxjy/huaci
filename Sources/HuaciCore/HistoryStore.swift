@@ -15,11 +15,10 @@ public struct FavoriteItem: Identifiable, Equatable, Sendable {
     public var headword: String { result.word?.headword ?? result.sourceText }
 }
 
-public struct CachedTranslation: Identifiable, Equatable, Sendable {
-    public let id: Int64
-    public let result: TranslationResult
-    /// When the model produced this result.
-    public let createdAt: Date
+public enum FavoriteOrder: String, CaseIterable, Sendable {
+    /// Most recently saved first.
+    case recent
+    case alphabetical
 }
 
 public enum StoreError: Error, Equatable {
@@ -83,6 +82,10 @@ public final class HistoryStore: @unchecked Sendable {
         }
     }
 
+    public func historyCount() throws -> Int {
+        Int(try query("SELECT COUNT(*) FROM history", []) { $0.int(0) }.first ?? 0)
+    }
+
     public func deleteHistory(id: Int64) throws {
         try write("DELETE FROM history WHERE id = ?", [.int(id)])
     }
@@ -122,14 +125,21 @@ public final class HistoryStore: @unchecked Sendable {
         try !query("SELECT 1 FROM favorites WHERE headword = ? AND target_language = ?", [.text(headword), .text(targetLanguage)]) { _ in true }.isEmpty
     }
 
-    public func favorites(search: String? = nil) throws -> [FavoriteItem] {
+    public func favoritesCount() throws -> Int {
+        Int(try query("SELECT COUNT(*) FROM favorites", []) { $0.int(0) }.first ?? 0)
+    }
+
+    public func favorites(search: String? = nil, order: FavoriteOrder = .recent) throws -> [FavoriteItem] {
         var sql = "SELECT id, payload, created_at FROM favorites"
         var params: [Value] = []
         if let pattern = Self.likePattern(search) {
             sql += " WHERE headword LIKE ? ESCAPE '\\' OR translation LIKE ? ESCAPE '\\'"
             params = [.text(pattern), .text(pattern)]
         }
-        sql += " ORDER BY created_at DESC, id DESC"
+        switch order {
+        case .recent: sql += " ORDER BY created_at DESC, id DESC"
+        case .alphabetical: sql += " ORDER BY headword COLLATE NOCASE, id"
+        }
         return try query(sql, params) { row in
             guard let result = try? self.decode(row.text(1)) else { return nil }
             return FavoriteItem(id: row.int(0), result: result, createdAt: Date(timeIntervalSince1970: row.real(2)))
@@ -156,14 +166,6 @@ public final class HistoryStore: @unchecked Sendable {
             [.text(request.text), .text(request.kind.rawValue), .text(request.targetLanguage.code), .text(try encode(result)),
              .real(date.timeIntervalSince1970)]
         )
-    }
-
-    public func cachedTranslations(limit: Int = 500) throws -> [CachedTranslation] {
-        try query("SELECT rowid, payload, created_at FROM translation_cache ORDER BY created_at DESC, rowid DESC LIMIT ?",
-                  [.int(Int64(limit))]) { row in
-            guard let result = try? self.decode(row.text(1)) else { return nil }
-            return CachedTranslation(id: row.int(0), result: result, createdAt: Date(timeIntervalSince1970: row.real(2)))
-        }
     }
 
     public func translationCacheCount() throws -> Int {
