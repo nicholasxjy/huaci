@@ -34,6 +34,21 @@ public protocol TranslationCache: AnyObject {
 public final class TranslationFlow {
     public typealias Capture = (pid_t?) async -> CaptureOutcome
 
+    public enum State: Equatable, Sendable {
+        case idle
+        case capturing(UUID)
+        case translating(UUID)
+        case succeeded(UUID)
+        case failed(UUID, FlowError)
+
+        public var requestID: UUID? {
+            switch self {
+            case .idle: return nil
+            case .capturing(let id), .translating(let id), .succeeded(let id), .failed(let id, _): return id
+            }
+        }
+    }
+
     private let capture: Capture
     private let rules: () -> LanguageRules
     private let makeTranslator: () throws -> Translator
@@ -41,9 +56,10 @@ public final class TranslationFlow {
     private let onSuccess: (TranslationResult) -> Void
     public weak var presenter: TranslationPresenter?
 
-    public private(set) var currentRequestID: UUID?
+    public private(set) var state: State = .idle
+    public var currentRequestID: UUID? { state.requestID }
     private var task: Task<Void, Never>?
-    private var lastAnalysis: TextAnalysis?
+    private var lastAttempt: (analysis: TextAnalysis, useCache: Bool)?
 
     public init(capture: @escaping Capture,
                 rules: @escaping () -> LanguageRules,
@@ -60,18 +76,24 @@ public final class TranslationFlow {
     /// Starts a new request from the current selection, replacing any running one.
     @discardableResult
     public func trigger(frontmostPID: pid_t?) -> UUID {
-        let id = start()
+        cancel()
+        lastAttempt = nil
+        let id = UUID()
+        state = .capturing(id)
         task = Task { [weak self] in
             guard let self else { return }
+            defer { if self.currentRequestID == id { self.task = nil } }
             let outcome = await self.capture(frontmostPID)
             guard self.isCurrent(id) else { return }
             switch outcome {
             case .failure(.cancelled):
-                return
+                self.cancel()
             case .failure(let failure):
+                self.state = .failed(id, .capture(failure))
                 self.presenter?.show(error: .capture(failure), requestID: id)
             case .success(let text, _):
                 guard let analysis = TextAnalyzer.analyze(text, rules: self.rules()) else {
+                    self.state = .failed(id, .invalidSelection)
                     self.presenter?.show(error: .invalidSelection, requestID: id)
                     return
                 }
@@ -86,46 +108,51 @@ public final class TranslationFlow {
     /// `useCache: false` asks the model again and refreshes the cached result.
     @discardableResult
     public func translate(text: String, targetLanguage: String? = nil, useCache: Bool = true) -> UUID {
-        let id = start()
         guard var analysis = TextAnalyzer.analyze(text, rules: rules()) else {
+            cancel()
+            lastAttempt = nil
+            let id = UUID()
+            state = .failed(id, .invalidSelection)
             presenter?.show(error: .invalidSelection, requestID: id)
             return id
         }
         if let targetLanguage { analysis.targetLanguage = targetLanguage }
-        task = Task { [weak self] in await self?.translate(analysis, id: id, useCache: useCache) }
-        return id
+        return startTranslation(analysis, useCache: useCache)
     }
 
-    /// Translates the last captured text again, e.g. after an error.
+    /// Translates the latest analyzed input again, preserving its cache policy.
     @discardableResult
     public func retry() -> UUID? {
-        guard let analysis = lastAnalysis else { return nil }
-        let id = start()
-        task = Task { [weak self] in await self?.translate(analysis, id: id) }
-        return id
+        guard let lastAttempt else { return nil }
+        return startTranslation(lastAttempt.analysis, useCache: lastAttempt.useCache)
     }
 
     /// Translates the last text into another language, for this request only.
     @discardableResult
     public func retarget(_ targetLanguage: String) -> UUID? {
-        guard var analysis = lastAnalysis else { return nil }
+        guard var analysis = lastAttempt?.analysis else { return nil }
         analysis.targetLanguage = targetLanguage
-        let id = start()
-        task = Task { [weak self] in await self?.translate(analysis, id: id) }
-        return id
+        return startTranslation(analysis)
     }
 
     /// Called when the result window closes: stops waiting for the current request.
     public func cancel() {
-        currentRequestID = nil
+        state = .idle
         task?.cancel()
         task = nil
     }
 
-    private func start() -> UUID {
-        task?.cancel()
+    private func startTranslation(_ analysis: TextAnalysis, useCache: Bool = true) -> UUID {
+        cancel()
         let id = UUID()
-        currentRequestID = id
+        state = .translating(id)
+        // Capture retry input before the task can be replaced by another request.
+        lastAttempt = (analysis, useCache)
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer { if self.currentRequestID == id { self.task = nil } }
+            await self.translate(analysis, id: id, useCache: useCache)
+        }
         return id
     }
 
@@ -134,8 +161,11 @@ public final class TranslationFlow {
     }
 
     private func translate(_ analysis: TextAnalysis, id: UUID, useCache: Bool = true) async {
-        lastAnalysis = analysis
+        guard isCurrent(id) else { return }
+        lastAttempt = (analysis, useCache)
+        state = .translating(id)
         presenter?.showLoading(requestID: id, sourceText: analysis.text)
+        guard isCurrent(id) else { return }
         let request = TranslationRequest(
             id: id,
             text: analysis.text,
@@ -145,20 +175,25 @@ public final class TranslationFlow {
         )
         // Cache failures fall through to the model; they never block a lookup.
         if useCache, let cached = try? cache?.cachedResult(for: request) {
+            state = .succeeded(id)
             onSuccess(cached)
+            guard isCurrent(id) else { return }
             presenter?.show(result: cached, requestID: id)
             return
         }
         do {
             let result = try await makeTranslator().translate(request)
-            try? cache?.cache(result, for: request, at: Date())
             guard isCurrent(id) else { return }
+            try? cache?.cache(result, for: request, at: Date())
+            state = .succeeded(id)
             onSuccess(result)
+            guard isCurrent(id) else { return }
             presenter?.show(result: result, requestID: id)
         } catch {
             guard isCurrent(id) else { return }
-            let translationError = (error as? TranslationError) ?? .network(error.localizedDescription)
-            if translationError == .cancelled { return }
+            let translationError: TranslationError = error is CancellationError
+                ? .cancelled : (error as? TranslationError) ?? .network(error.localizedDescription)
+            state = .failed(id, .translation(translationError))
             presenter?.show(error: .translation(translationError), requestID: id)
         }
     }

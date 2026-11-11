@@ -211,7 +211,9 @@ public actor OAuthSession {
     public nonisolated let provider: OAuthProvider
     private let store: CredentialStore
     private let session: URLSession
-    private var refreshTask: Task<OAuthTokens, Error>?
+    private var refreshTask: (id: UUID, task: Task<OAuthTokens, Error>)?
+    private var signInAttempt: (id: UUID, server: OAuthCallbackServer)?
+    private var unsavedTokens: OAuthTokens?
 
     /// Tokens are refreshed this long before they expire.
     static let refreshMargin: TimeInterval = 120
@@ -230,14 +232,23 @@ public actor OAuthSession {
     @discardableResult
     public func signIn(open: @escaping @Sendable (URL) async -> Void) async throws -> OAuthTokens {
         try checkClient()
-        let server = OAuthCallbackServer(port: provider.callbackPort, path: provider.callbackPath)
-        let port = try await server.start()
-        defer { server.stop() }
-
+        guard !Task.isCancelled else { throw TranslationError.cancelled }
+        signInAttempt?.server.stop()
+        let id = UUID()
         let pkce = PKCE.generate()
         let state = Base64URL.encode(PKCE.randomBytes(24))
+        let server = OAuthCallbackServer(port: provider.callbackPort, path: provider.callbackPath, expectedState: state)
+        signInAttempt = (id, server)
+        defer {
+            server.stop()
+            if signInAttempt?.id == id { signInAttempt = nil }
+        }
+        let port = try await server.start()
+        try checkSignIn(id)
+
         let redirectURI = provider.redirectURI(port: port)
         await open(provider.authorizationURL(pkce: pkce, state: state, redirectURI: redirectURI))
+        try checkSignIn(id)
 
         let params: [String: String]
         do {
@@ -245,6 +256,7 @@ public actor OAuthSession {
         } catch TranslationError.timeout {
             throw TranslationError.notConfigured("等待浏览器授权超时，请重新登录。")
         }
+        try checkSignIn(id)
         guard params["state"] == state else {
             throw TranslationError.notConfigured("登录校验失败（state 不匹配），请重试。")
         }
@@ -265,40 +277,54 @@ public actor OAuthSession {
         ]
         if let secret = provider.clientSecret { form.append(("client_secret", secret)) }
         let response = try await requestTokens(form)
+        try checkSignIn(id)
         guard let refreshToken = response.refreshToken else {
             throw TranslationError.notConfigured("\(provider.name) 没有返回 refresh token，请重新登录。")
         }
         let account = try await provider.resolveAccount(response, session)
+        try checkSignIn(id)
         let tokens = OAuthTokens(accessToken: response.accessToken, refreshToken: refreshToken,
                                  expiresAt: response.expiry(now: Date()), email: account.email,
                                  accountID: account.accountID, projectID: account.projectID)
-        refreshTask?.cancel()
+        refreshTask?.task.cancel()
         refreshTask = nil
         guard store.save(tokens) else {
             throw TranslationError.notConfigured("登录信息保存到钥匙串失败，请重试。")
         }
+        unsavedTokens = nil
         return tokens
     }
 
     public func signOut() {
-        refreshTask?.cancel()
+        signInAttempt?.server.stop()
+        signInAttempt = nil
+        refreshTask?.task.cancel()
         refreshTask = nil
+        unsavedTokens = nil
         store.clear()
     }
 
     /// Stored tokens, refreshed first when expiring or when `forceRefresh` is
     /// set (after the API rejected the current access token).
     public func validTokens(forceRefresh: Bool = false) async throws -> OAuthTokens {
-        if let refreshTask { return try await refreshTask.value }
+        if let refreshTask { return try await refreshTask.task.value }
+        if let unsavedTokens {
+            try persistRefreshedTokens(unsavedTokens)
+        }
         guard let tokens = store.load() else {
             throw TranslationError.notConfigured("请先在设置中登录 \(provider.name)。")
         }
         guard forceRefresh || tokens.expiresAt.timeIntervalSinceNow < Self.refreshMargin else { return tokens }
 
+        let id = UUID()
         let task = Task { try await self.refresh(tokens) }
-        refreshTask = task
-        defer { refreshTask = nil }
+        refreshTask = (id, task)
+        defer { if refreshTask?.id == id { refreshTask = nil } }
         return try await task.value
+    }
+
+    private func checkSignIn(_ id: UUID) throws {
+        guard signInAttempt?.id == id, !Task.isCancelled else { throw TranslationError.cancelled }
     }
 
     private func checkClient() throws {
@@ -325,8 +351,17 @@ public actor OAuthSession {
         }
         // Signed out while the refresh was in flight: don't bring the tokens back.
         try Task.checkCancellation()
-        store.save(updated)
+        // Retain rotated credentials until persistence succeeds or the user signs out.
+        unsavedTokens = updated
+        try persistRefreshedTokens(updated)
         return updated
+    }
+
+    private func persistRefreshedTokens(_ tokens: OAuthTokens) throws {
+        guard store.save(tokens) else {
+            throw TranslationError.notConfigured("刷新后的登录信息无法保存到钥匙串。请检查钥匙串权限后重试；退出应用前请先恢复保存。")
+        }
+        unsavedTokens = nil
     }
 
     private func requestTokens(_ form: [(String, String)]) async throws -> OAuthTokenResponse {

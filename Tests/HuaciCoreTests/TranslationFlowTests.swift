@@ -313,6 +313,161 @@ struct TranslationFlowTests {
         #expect(spy.targets == ["fr", "zh-Hans"])
     }
 
+    @Test func lifecycleTracksCaptureTranslationSuccessFailureAndCancellation() async {
+        let translator = ControlledTranslator()
+        let (flow, _) = makeFlow(captures: [.success(text: "hello", method: .accessibility)], translator: translator)
+        #expect(flow.state == .idle)
+
+        let first = flow.trigger(frontmostPID: 1)
+        #expect(flow.state == .capturing(first))
+        #expect(flow.currentRequestID == first)
+        await settle()
+        #expect(flow.state == .translating(first))
+
+        translator.release("hello")
+        await settle()
+        #expect(flow.state == .succeeded(first))
+
+        translator.failure = .timeout
+        let retry = flow.retry()!
+        #expect(flow.state == .translating(retry))
+        await settle()
+        #expect(flow.state == .failed(retry, .translation(.timeout)))
+
+        flow.cancel()
+        #expect(flow.state == .idle)
+        #expect(flow.currentRequestID == nil)
+    }
+
+    @Test func cancelledBeforeTaskStartsDoesNotPresentOrSave() async {
+        let translator = ControlledTranslator()
+        translator.release("Some sentence, here.")
+        var saved = 0
+        let (flow, presenter) = makeFlow(captures: [], translator: translator, saved: { _ in saved += 1 })
+
+        flow.translate(text: "Some sentence, here.")
+        flow.cancel()
+        await settle()
+
+        #expect(flow.state == .idle)
+        #expect(presenter.events.isEmpty)
+        #expect(saved == 0)
+    }
+
+    @Test(arguments: [false, true])
+    func providerCancellationEndsLoading(rawCancellation: Bool) async {
+        struct CancelledTranslator: Translator {
+            let rawCancellation: Bool
+            func translate(_ request: TranslationRequest) async throws -> TranslationResult {
+                if rawCancellation { throw CancellationError() }
+                throw TranslationError.cancelled
+            }
+        }
+        let (flow, presenter) = makeFlow(captures: [], translator: CancelledTranslator(rawCancellation: rawCancellation))
+
+        let id = flow.translate(text: "Some sentence, here.")
+        await settle()
+
+        #expect(flow.state == .failed(id, .translation(.cancelled)))
+        #expect(presenter.events.last == .error(id, .translation(.cancelled)))
+    }
+
+    @Test func successCallbackCancellationSuppressesPresentation() async {
+        let translator = ControlledTranslator()
+        translator.release("Some sentence, here.")
+        weak var activeFlow: TranslationFlow?
+        let (flow, presenter) = makeFlow(captures: [], translator: translator, saved: { _ in activeFlow?.cancel() })
+        activeFlow = flow
+
+        let id = flow.translate(text: "Some sentence, here.")
+        await settle()
+
+        #expect(flow.state == .idle)
+        #expect(presenter.events == [.loading(id, "Some sentence, here.")])
+    }
+
+    @Test func immediateRetryUsesNewestTypedText() async {
+        let translator = ControlledTranslator()
+        translator.release("First sentence here.")
+        translator.release("Second sentence here.")
+        let (flow, presenter) = makeFlow(captures: [], translator: translator)
+        flow.translate(text: "First sentence here.")
+        await settle()
+
+        flow.translate(text: "Second sentence here.")
+        let retry = flow.retry()
+        await settle()
+
+        #expect(retry != nil)
+        #expect(presenter.events.last == .result(retry!, "译:Second sentence here."))
+    }
+
+    @Test func failedCaptureCannotRetryPreviousSelection() async {
+        let translator = ControlledTranslator()
+        translator.release("Previous sentence here.")
+        let (flow, _) = makeFlow(captures: [.failure(.copyTimedOut)], translator: translator)
+        flow.translate(text: "Previous sentence here.")
+        await settle()
+
+        flow.trigger(frontmostPID: 1)
+        await settle()
+
+        #expect(flow.retry() == nil)
+        #expect(flow.retarget("ja") == nil)
+    }
+
+    @Test func invalidTypedTextCannotRetryPreviousInput() async {
+        let translator = ControlledTranslator()
+        translator.release("Previous sentence here.")
+        let (flow, _) = makeFlow(captures: [], translator: translator)
+        flow.translate(text: "Previous sentence here.")
+        await settle()
+
+        flow.translate(text: "1234 !!")
+
+        #expect(flow.retry() == nil)
+        #expect(flow.retarget("ja") == nil)
+    }
+
+    @Test func cancelledResultCannotPopulateCache() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("huaci-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try HistoryStore(url: url)
+        let translator = ControlledTranslator()
+        let (flow, presenter) = makeFlow(captures: [], translator: translator, cache: store)
+        let request = TranslationRequest(text: "Some sentence, here.", kind: .text, sourceLanguage: "en", targetLanguage: .named("zh-Hans"))
+
+        flow.translate(text: request.text)
+        await settle()
+        flow.cancel()
+        translator.release(request.text)
+        await settle()
+
+        #expect(presenter.results.isEmpty)
+        #expect(try store.cachedResult(for: request) == nil)
+    }
+
+    @Test func retryPreservesCacheBypass() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("huaci-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try HistoryStore(url: url)
+        let request = TranslationRequest(text: "Some sentence, here.", kind: .text, sourceLanguage: "en", targetLanguage: .named("zh-Hans"))
+        try store.cache(TranslationResult(kind: .text, sourceText: request.text, sourceLanguage: "en", targetLanguage: "zh-Hans",
+                                         translation: "Old cached translation", word: nil), for: request)
+        let translator = ControlledTranslator()
+        translator.release(request.text)
+        translator.failure = .timeout
+        let (flow, presenter) = makeFlow(captures: [], translator: translator, cache: store)
+        flow.translate(text: request.text, useCache: false)
+        await settle()
+        translator.failure = nil
+
+        let retry = flow.retry()
+        await settle()
+
+        #expect(presenter.events.last == .result(retry!, "译:Some sentence, here."))
+    }
+
     @Test func bypassingCacheAsksModelAgainAndRefreshesCache() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("huaci-\(UUID().uuidString).sqlite")
         defer { try? FileManager.default.removeItem(at: url) }

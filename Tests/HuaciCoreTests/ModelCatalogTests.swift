@@ -10,6 +10,7 @@ extension TranslatorTests {
             let models = try await ModelCatalog.personalAPI(baseURL: "https://api.example.com/v1/", apiKey: " sk-1 ", session: session)
 
             #expect(models.map(\.id) == ["gpt-a", "gpt-b"])
+            #expect(models.allSatisfy { !$0.isSuggested })
             let sent = try #require(StubURLProtocol.requests.first).request
             #expect(sent.httpMethod == "GET")
             #expect(sent.url?.absoluteString == "https://api.example.com/v1/models")
@@ -51,6 +52,7 @@ extension TranslatorTests {
             let models = try await ModelCatalog.chatGPT(auth: auth, session: session)
 
             #expect(models == [RemoteModel(id: "gpt-a", displayName: "GPT-A"), RemoteModel(id: "gpt-b", displayName: "GPT-B")])
+            #expect(models.allSatisfy { !$0.isSuggested })
             let sent = try #require(StubURLProtocol.requests.first).request
             let components = try #require(sent.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) })
             #expect(components.host == "chatgpt.com")
@@ -63,7 +65,7 @@ extension TranslatorTests {
         @Test func antigravityListsChatModelsInPickerOrder() async throws {
             let session = StubURLProtocol.session([
                 .init(status: 200, body: #"{"cloudaicompanionProject":"proj-1","currentTier":{"id":"standard-tier"},"paidTier":{"id":"g1-pro-tier"}}"#),
-                .init(status: 400, body: #"{"error":{"message":"FAILED_PRECONDITION"}}"#),
+                .init(status: 400, body: #"{"error":{"message":"FAILED_PRECONDITION: invalid entitlement userTier"}}"#),
                 .init(status: 200, body: """
                 {"models":{
                   "gemini-3-flash":{"displayName":"Gemini 3 Flash"},
@@ -85,6 +87,7 @@ extension TranslatorTests {
                 RemoteModel(id: "gemini-3-flash", displayName: "Gemini 3 Flash"),
                 RemoteModel(id: "gemini-3.1-pro-low", displayName: "Gemini 3.1 Pro (Low)"),
             ])
+            #expect(models.allSatisfy { !$0.isSuggested })
             let sent = StubURLProtocol.requests.map(\.request)
             #expect(sent.map { $0.url?.absoluteString } == [
                 "https://prod.example.com/v1internal:loadCodeAssist",
@@ -98,10 +101,24 @@ extension TranslatorTests {
             #expect(accepted["entitlement"] as? [String: String] == ["userTier": "standard-tier"])
         }
 
-        @Test func antigravityFreeTierNamesNoEntitlement() async throws {
+        @Test func modelRateLimitIsNotRetriedWithAnotherEntitlement() async throws {
+            let session = StubURLProtocol.session([
+                .init(status: 200, body: #"{"currentTier":{"id":"standard-tier"},"paidTier":{"id":"g1-pro-tier"}}"#),
+                .init(status: 429, body: #"{"error":{"message":"quota"}}"#),
+                .init(status: 200, body: #"{"models":{}}"#),
+            ])
+            let auth = OAuthSession(provider: .antigravity, store: MemoryCredentialStore(TranslatorTests.freshTokens), session: session)
+            await #expect(throws: TranslationError.rateLimited) {
+                try await ModelCatalog.antigravity(auth: auth, session: session, backend: TranslatorTests.Antigravity.backend)
+            }
+            #expect(StubURLProtocol.requests.count == 2)
+        }
+
+        @Test(arguments: [#"{"models":{}}"#, #"{"models":{"chat_only":{},"tab_only":{}}}"#])
+        func antigravityFreeTierNamesNoEntitlement(_ reply: String) async throws {
             let session = StubURLProtocol.session([
                 .init(status: 200, body: #"{"cloudaicompanionProject":"proj-1","currentTier":{"id":"free-tier"}}"#),
-                .init(status: 200, body: #"{"models":{}}"#),
+                .init(status: 200, body: reply),
             ])
             let auth = OAuthSession(provider: .antigravity, store: MemoryCredentialStore(TranslatorTests.freshTokens), session: session)
 
@@ -110,6 +127,7 @@ extension TranslatorTests {
             #expect(try StubURLProtocol.bodyJSON(1)["entitlement"] == nil)
             // Nothing listed: Antigravity's usual models are offered instead.
             #expect(models.map(\.id).contains("gemini-3-flash"))
+            #expect(models.allSatisfy { $0.isSuggested })
         }
     }
 }

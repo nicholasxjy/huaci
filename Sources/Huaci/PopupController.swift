@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import HuaciCore
 import SwiftUI
 
@@ -44,9 +45,21 @@ final class PopupController: TranslationPresenter {
     private var anchor: CGPoint = .zero
     private var monitors: [Any] = []
     private var hintDismissal: Task<Void, Never>?
+    private var subscriptions: Set<AnyCancellable> = []
 
     init(model: AppModel) {
         self.model = model
+        model.$storeError.sink { [weak self] error in
+            self?.state.storeError = error
+            DispatchQueue.main.async { [weak self] in self?.updateFrame() }
+        }.store(in: &subscriptions)
+        model.$dataVersion.sink { [weak self] _ in
+            guard let self, let result = self.state.result else { return }
+            self.state.isFavorite = self.model.isFavorite(result)
+        }.store(in: &subscriptions)
+        NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
+            .sink { [weak self] _ in self?.updateFrame() }
+            .store(in: &subscriptions)
     }
 
     /// Records the mouse position when the hotkey fires.
@@ -60,6 +73,7 @@ final class PopupController: TranslationPresenter {
         state.copied = false
         state.content = .loading(sourceText)
         present()
+        AccessibilityAnnouncement.post("正在翻译。")
     }
 
     func show(result: TranslationResult, requestID: UUID) {
@@ -68,6 +82,7 @@ final class PopupController: TranslationPresenter {
         state.content = .result(result)
         present()
         model.didShowPopupResult()
+        AccessibilityAnnouncement.post("翻译完成。")
     }
 
     func show(error: FlowError, requestID: UUID) {
@@ -75,32 +90,41 @@ final class PopupController: TranslationPresenter {
         if presentation.isHint {
             state.content = .hint(presentation.title)
             present()
-            hintDismissal = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
-                guard let self, !Task.isCancelled, case .hint = self.state.content else { return }
-                self.close()
+            if let duration = Self.hintDuration(text: presentation.title, voiceOver: NSWorkspace.shared.isVoiceOverEnabled) {
+                hintDismissal = Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
+                    guard let self, !Task.isCancelled, case .hint = self.state.content else { return }
+                    self.close()
+                }
             }
         } else {
             state.content = .error(error)
             present()
         }
+        AccessibilityAnnouncement.post([presentation.title, presentation.message].filter { !$0.isEmpty }.joined(separator: "。"))
+    }
+
+    /// VoiceOver hints remain until explicitly dismissed; other hints allow reading time.
+    static func hintDuration(text: String, voiceOver: Bool) -> TimeInterval? {
+        voiceOver ? nil : min(12, max(4, Double(text.count) / 6))
     }
 
     // MARK: Window
 
     func close() {
-        guard let panel, panel.isVisible else { return }
         hintDismissal?.cancel()
+        hintDismissal = nil
         model.cancelTranslation()
         model.speech.stop()
         removeMonitors()
         state.isPinned = false
-        panel.isMovableByWindowBackground = false
-        panel.orderOut(nil)
+        panel?.isMovableByWindowBackground = false
+        panel?.orderOut(nil)
     }
 
     private func present() {
         hintDismissal?.cancel()
+        hintDismissal = nil
         state.modelName = model.activeModelName
         state.serviceLine = model.serviceLine
         state.shortcut = model.settings.shortcut.displayString
@@ -134,7 +158,7 @@ final class PopupController: TranslationPresenter {
         panel.onCancel = { [weak self] in self?.close() }
         panel.onKey = { [weak self] event in self?.handleKey(event) ?? false }
 
-        let hostingView = PopupHostingView(rootView: PopupView(state: state, actions: makeActions()))
+        let hostingView = PopupHostingView(rootView: PopupView(state: state, speech: model.speech, actions: makeActions()))
         panel.contentView = hostingView
         self.hostingView = hostingView
         return panel
@@ -148,7 +172,7 @@ final class PopupController: TranslationPresenter {
         let size = hostingView.fittingSize
         let frame: CGRect
         if state.isPinned && panel.isVisible {
-            frame = CGRect(x: panel.frame.minX, y: panel.frame.maxY - size.height, width: size.width, height: size.height)
+            frame = PopupPositioner.pinnedFrame(size: size, previous: panel.frame, screens: NSScreen.screens.map(\.visibleFrame))
         } else {
             frame = PopupPositioner.frame(size: size, mouse: anchor, screens: NSScreen.screens.map(\.visibleFrame))
         }
@@ -171,7 +195,7 @@ final class PopupController: TranslationPresenter {
         }
         // Clicks in this app's regular windows, and Esc while the panel is key.
         // Menus opened from the panel (the language menu) are not "outside".
-        if let local = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown], handler: { [weak self] event in
+        if let local = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown], handler: { [weak self] event in
             guard let self, let panel = self.panel else { return event }
             if event.type == .keyDown {
                 if event.keyCode == 53, event.window === panel {
@@ -208,7 +232,13 @@ final class PopupController: TranslationPresenter {
             case "c", "s", "r", "o":
                 guard let result = state.result else { return false }
                 switch key {
-                case "c": copy(result.translation)
+                case "c":
+                    if let textView = panel?.firstResponder as? NSTextView,
+                       textView.selectedRanges.contains(where: { $0.rangeValue.length > 0 }) {
+                        textView.copy(nil)
+                    } else {
+                        copy(result.translation)
+                    }
                 case "s":
                     guard result.kind == .word else { return false }
                     toggleFavorite(result)
@@ -234,11 +264,11 @@ final class PopupController: TranslationPresenter {
     }
 
     private func speak(_ result: TranslationResult) {
-        model.speech.speak(result.word?.headword ?? result.sourceText, language: result.sourceLanguage)
+        model.speech.toggle(result)
     }
 
     private func toggleFavorite(_ result: TranslationResult) {
-        state.isFavorite = model.toggleFavorite(result)
+        if let isFavorite = model.toggleFavorite(result) { state.isFavorite = isFavorite }
     }
 
     private func togglePin() {
@@ -268,7 +298,6 @@ final class PopupController: TranslationPresenter {
     private func makeActions() -> PopupActions {
         PopupActions(
             copy: { [weak self] in self?.copy($0) },
-            speak: { [weak self] in self?.speak($0) },
             toggleFavorite: { [weak self] in self?.toggleFavorite($0) },
             retarget: { [weak self] in self?.model.retargetPopup($0) },
             togglePin: { [weak self] in self?.togglePin() },

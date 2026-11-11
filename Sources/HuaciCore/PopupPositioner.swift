@@ -25,6 +25,25 @@ public enum PopupPositioner {
         return CGRect(x: x, y: y, width: width, height: height)
     }
 
+    /// Keeps the pinned top edge when possible, choosing the display with the
+    /// largest overlap and recovering onto the nearest remaining display.
+    public static func pinnedFrame(size: CGSize, previous: CGRect, screens: [CGRect]) -> CGRect {
+        let overlapping = screens.filter { $0.intersects(previous) }.max { a, b in
+            let lhs = a.intersection(previous)
+            let rhs = b.intersection(previous)
+            return lhs.width * lhs.height < rhs.width * rhs.height
+        }
+        let topLeft = CGPoint(x: previous.minX, y: previous.maxY)
+        guard let screen = overlapping ?? screen(containing: topLeft, in: screens) else {
+            return CGRect(x: topLeft.x, y: topLeft.y - size.height, width: size.width, height: size.height)
+        }
+        let width = min(size.width, screen.width)
+        let height = min(size.height, screen.height)
+        return CGRect(x: clamp(topLeft.x, screen.minX, screen.maxX - width),
+                      y: clamp(topLeft.y - height, screen.minY, screen.maxY - height),
+                      width: width, height: height)
+    }
+
     static func screen(containing point: CGPoint, in screens: [CGRect]) -> CGRect? {
         if let match = screens.first(where: { $0.insetBy(dx: -1, dy: -1).contains(point) }) { return match }
         return screens.min { distance(point, $0) < distance(point, $1) }

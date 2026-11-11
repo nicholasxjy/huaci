@@ -54,6 +54,24 @@ struct ResultParserTests {
         #expect(result.translation == "你好。")
     }
 
+    @Test(arguments: ["Use {name} here.", "Braces {like} and {this} are prose.", "An unmatched { brace."])
+    func proseWithBracesIsPlainText(_ content: String) throws {
+        #expect(try ResultParser.parse(content, for: textRequest).translation == content)
+    }
+
+    @Test(arguments: [#"{"kind":"text","translation":"partial"#,
+                      #"Here is the result: {"translation":"partial"#,
+                      "```json\n{\"translation\":\"partial",
+                      #"{"translation":"one"}{"translation":"two"}"#])
+    func truncatedOrAdjacentJSONIsRejected(_ content: String) {
+        #expect(throws: TranslationError.invalidResponse) { try ResultParser.parse(content, for: textRequest) }
+    }
+
+    @Test func extractsOneObjectWithoutGreedyBraces() throws {
+        let content = #"Use {name}; result: {"translation":"quote \\\" and {braces}"} trailing {prose}."#
+        #expect(try ResultParser.parse(content, for: textRequest).translation == #"quote \" and {braces}"#)
+    }
+
     @Test(arguments: ["", "   ", #"{"kind":"word","senses":[]}"#, "{not json}"])
     func unusableRepliesThrow(_ content: String) {
         #expect(throws: TranslationError.invalidResponse) {

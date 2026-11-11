@@ -24,15 +24,14 @@ public enum ResultParser {
     }
 
     public static func parse(_ content: String, for request: TranslationRequest) throws -> TranslationResult {
-        if let json = extractJSONObject(content),
-           let data = json.data(using: .utf8),
-           let payload = try? JSONDecoder().decode(Payload.self, from: data),
-           let result = makeResult(payload, for: request) {
+        let plain = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let json = try extractJSONObject(plain) {
+            guard let payload = try? JSONDecoder().decode(Payload.self, from: Data(json.utf8)),
+                  let result = makeResult(payload, for: request) else { throw TranslationError.invalidResponse }
             return result
         }
-        // Model ignored the JSON format: show its plain reply as the translation.
-        let plain = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !plain.isEmpty, extractJSONObject(plain) == nil else { throw TranslationError.invalidResponse }
+        // Plain prose may contain braces, but an attempted JSON reply must decode.
+        guard !plain.isEmpty, !plain.hasPrefix("```json") else { throw TranslationError.invalidResponse }
         return TranslationResult(
             kind: .text,
             sourceText: request.text,
@@ -84,12 +83,42 @@ public enum ResultParser {
         )
     }
 
-    /// Returns the outermost `{...}` block, dropping markdown fences or prose.
-    static func extractJSONObject(_ content: String) -> String? {
-        guard let start = content.firstIndex(of: "{"), let end = content.lastIndex(of: "}"), start < end else {
-            return nil
+    /// Extracts one balanced object, respecting braces and escapes inside strings.
+    static func extractJSONObject(_ content: String) throws -> String? {
+        guard let start = jsonStart(in: content[...]) else { return nil }
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for index in content[start...].indices {
+            let character = content[index]
+            if inString {
+                if escaped { escaped = false }
+                else if character == "\\" { escaped = true }
+                else if character == "\"" { inString = false }
+            } else if character == "\"" {
+                inString = true
+            } else if character == "{" {
+                depth += 1
+            } else if character == "}" {
+                depth -= 1
+                if depth == 0 {
+                    let tail = content[content.index(after: index)...]
+                    guard jsonStart(in: tail) == nil else { throw TranslationError.invalidResponse }
+                    return String(content[start...index])
+                }
+            }
         }
-        return String(content[start...end])
+        throw TranslationError.invalidResponse
+    }
+
+    private static func jsonStart(in content: Substring) -> String.Index? {
+        for index in content.indices where content[index] == "{" {
+            let rest = content[content.index(after: index)...].drop(while: { $0.isWhitespace })
+            if index == content.startIndex || rest.isEmpty || rest.first == "\"" || rest.first == "}" {
+                return index
+            }
+        }
+        return nil
     }
 
     private static func clean(_ value: String) -> String {

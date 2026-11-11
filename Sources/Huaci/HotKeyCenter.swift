@@ -5,6 +5,7 @@ enum HotKeyError: Error, Equatable {
     case invalid
     case takenBySystem
     case registrationFailed(OSStatus)
+    case handlerInstallationFailed(OSStatus)
 
     var message: String {
         switch self {
@@ -16,6 +17,8 @@ enum HotKeyError: Error, Equatable {
             return "该快捷键已被其他应用占用，请换一个组合。"
         case .registrationFailed(let status):
             return "快捷键注册失败（\(status)），请换一个组合。"
+        case .handlerInstallationFailed(let status):
+            return "快捷键事件处理器安装失败（\(status)），请重启应用后重试。"
         }
     }
 }
@@ -30,10 +33,10 @@ final class HotKeyCenter {
     private var handlerRef: EventHandlerRef?
 
     func register(_ shortcut: Shortcut) -> Result<Void, HotKeyError> {
-        unregister()
         guard shortcut.isValid else { return .failure(.invalid) }
         guard !Self.isTakenBySystem(shortcut) else { return .failure(.takenBySystem) }
-        installHandlerIfNeeded()
+        if let error = installHandlerIfNeeded() { return .failure(error) }
+        unregister()
 
         var ref: EventHotKeyRef?
         let id = EventHotKeyID(signature: OSType(0x4855_4143), id: 1) // "HUAC"
@@ -49,13 +52,18 @@ final class HotKeyCenter {
         hotKeyRef = nil
     }
 
-    private func installHandlerIfNeeded() {
-        guard handlerRef == nil else { return }
+    private func installHandlerIfNeeded() -> HotKeyError? {
+        guard handlerRef == nil else { return nil }
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+        let status = InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
             DispatchQueue.main.async { HotKeyCenter.shared.onPress?() }
             return noErr
         }, 1, &spec, nil, &handlerRef)
+        guard status == noErr, handlerRef != nil else {
+            handlerRef = nil
+            return .handlerInstallationFailed(status == noErr ? OSStatus(paramErr) : status)
+        }
+        return nil
     }
 
     /// Checks enabled shortcuts in System Settings › Keyboard › Shortcuts.

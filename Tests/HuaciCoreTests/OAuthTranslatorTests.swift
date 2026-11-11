@@ -21,12 +21,13 @@ func completedEvents(_ text: String) -> String {
     ])
 }
 
-/// Code Assist's server-sent events: one `{response}` chunk per element.
-func geminiStream(_ chunks: [[[String: Any]]]) -> String {
-    chunks.map { parts in
+/// Code Assist's successful stream: text chunks followed by an explicit STOP candidate.
+func completedGeminiStream(_ chunks: [[[String: Any]]]) -> String {
+    let content = chunks.map { parts in
         let body: [String: Any] = ["response": ["candidates": [["content": ["role": "model", "parts": parts]]]]]
         return "data: " + String(decoding: try! JSONSerialization.data(withJSONObject: body), as: UTF8.self) + "\r\n\r\n"
     }.joined()
+    return content + "data: {\"response\":{\"candidates\":[{\"finishReason\":\"STOP\"}]}}\r\n\r\n"
 }
 
 extension TranslatorTests {
@@ -77,6 +78,49 @@ extension TranslatorTests {
             #expect(try await translator.translate(request).translation == "跑步")
         }
 
+        @Test func deltaOnlyEOFIsNotSuccess() async throws {
+            let events = sse([["type": "response.output_text.delta", "delta": "跑"]])
+            let (translator, _) = try translator([.init(status: 200, body: events)])
+            await #expect(throws: TranslationError.invalidResponse) { try await translator.translate(request) }
+        }
+
+        @Test func multilineCompletionIsFramedAsOneEvent() throws {
+            let events = """
+            : heartbeat
+            event: response.completed
+            data: {"type":"response.completed",
+            data: "response":{"output":[{"type":"message","content":[{"type":"output_text","text":"跑"}]}]}}
+
+
+            """
+            #expect(try ChatGPTTranslator.outputText(fromEvents: Data(events.utf8)) == "跑")
+        }
+
+        @Test func doneRequiresCompletedStatus() throws {
+            let delta = sse([["type": "response.output_text.delta", "delta": "跑"]])
+            for status in ["incomplete", "failed", "in_progress"] {
+                let events = delta + sse([["type": "response.done", "response": ["status": status]]])
+                #expect(throws: TranslationError.self) { try ChatGPTTranslator.outputText(fromEvents: Data(events.utf8)) }
+            }
+            let events = delta + sse([["type": "response.done", "response": ["status": "completed"]]])
+            #expect(try ChatGPTTranslator.outputText(fromEvents: Data(events.utf8)) == "跑")
+        }
+
+        @Test func doneWithoutResponseStatusIsRejected() {
+            let delta = sse([["type": "response.output_text.delta", "delta": "跑"]])
+            let terminals: [[String: Any]] = [
+                ["type": "response.done"],
+                ["type": "response.done", "status": "completed"],
+                ["type": "response.done", "response": ["status": NSNull()]],
+                ["type": "response.done", "response": ["status": ["type": "completed"]]],
+            ]
+            for terminal in terminals {
+                #expect(throws: TranslationError.self) {
+                    try ChatGPTTranslator.outputText(fromEvents: Data((delta + sse([terminal])).utf8))
+                }
+            }
+        }
+
         @Test func failedResponseIsReported() async throws {
             let events = sse([["type": "response.failed", "response": ["error": ["message": "model overloaded"]]]])
             let (translator, _) = try translator([.init(status: 200, body: events)])
@@ -124,7 +168,7 @@ extension TranslatorTests {
         }
 
         @Test func streamsRequestAsAntigravityDoes() async throws {
-            let translator = try translator([.init(status: 200, body: geminiStream([
+            let translator = try translator([.init(status: 200, body: completedGeminiStream([
                 [["text": "thinking…", "thought": true]],
                 [["text": #"{"kind":"text","#]],
                 [["text": #""translation":"你好，世界。"}"#]],
@@ -155,6 +199,31 @@ extension TranslatorTests {
             #expect(!systemText.contains("You are Antigravity"))
         }
 
+        @Test(arguments: ["MAX_TOKENS", "SAFETY", "RECITATION", "OTHER"])
+        func unsuccessfulFinishIsRejected(_ reason: String) throws {
+            let body: [String: Any] = ["response": ["candidates": [["content": ["parts": [["text": "partial"]]], "finishReason": reason]]]]
+            let events = "data: " + String(decoding: try JSONSerialization.data(withJSONObject: body), as: UTF8.self) + "\n\n"
+            #expect(throws: TranslationError.rejected(reason)) { try AntigravityTranslator.outputText(fromEvents: Data(events.utf8)) }
+        }
+
+        @Test func missingFinishIsNotSuccess() {
+            let events = "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}}\n\n"
+            #expect(throws: TranslationError.invalidResponse) { try AntigravityTranslator.outputText(fromEvents: Data(events.utf8)) }
+        }
+
+        @Test func multilineStopWithoutTextCompletesPriorDeltas() throws {
+            let events = """
+            data: {"response":{"candidates":[{"content":{"parts":[{"text":"你好"}]}}]}}
+
+            : heartbeat
+            data: {"response":{
+            data: "candidates":[{"finishReason":"STOP"}]}}
+
+
+            """
+            #expect(try AntigravityTranslator.outputText(fromEvents: Data(events.utf8)) == "你好")
+        }
+
         @Test func sessionIDFollowsFirstMessage() {
             #expect(AntigravityTranslator.sessionID(for: "a") == AntigravityTranslator.sessionID(for: "a"))
             #expect(AntigravityTranslator.sessionID(for: "a") != AntigravityTranslator.sessionID(for: "b"))
@@ -179,7 +248,7 @@ extension TranslatorTests {
             tokens.projectID = nil
             let translator = try translator([
                 .init(status: 200, body: #"{"cloudaicompanionProject":{"id":"proj-9"},"currentTier":{"id":"free-tier"}}"#),
-                .init(status: 200, body: geminiStream([[["text": #"{"kind":"text","translation":"你好"}"#]]])),
+                .init(status: 200, body: completedGeminiStream([[["text": #"{"kind":"text","translation":"你好"}"#]]])),
             ], tokens: tokens)
 
             #expect(try await translator.translate(request).translation == "你好")

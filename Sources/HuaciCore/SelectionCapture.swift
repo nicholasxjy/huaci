@@ -24,13 +24,13 @@ public protocol PasteboardAccess: AnyObject {
     /// Returns nil when some item or type cannot be read back, i.e. the contents
     /// could not be restored faithfully.
     func snapshot() -> PasteboardSnapshot?
-    func restore(_ snapshot: PasteboardSnapshot)
+    @discardableResult func restore(_ snapshot: PasteboardSnapshot) -> Bool
     func readString() -> String?
 }
 
 public enum AccessibilityReadResult: Equatable, Sendable {
     case text(String)
-    /// The focused element reports an empty selection or no selection attribute.
+    /// The focused element confirms that the selection is empty.
     case empty
     /// Accessibility could not answer (unsupported element, timeout).
     case unavailable
@@ -43,7 +43,7 @@ public protocol SelectionEnvironment: AnyObject {
     func frontmostProcessID() -> pid_t?
     func readSelectedText(pid: pid_t) -> AccessibilityReadResult
     /// Waits briefly for the user to release the hotkey's modifier keys.
-    func waitForModifierRelease() async
+    func waitForModifierRelease() async -> Bool
     /// Posts Command-C to the frontmost app. Returns false when the event could not be created.
     func sendCopyCommand() -> Bool
     func sleep(milliseconds: Int) async
@@ -61,6 +61,10 @@ public enum CaptureFailure: Error, Equatable, Sendable {
     case frontmostAppChanged
     /// The clipboard holds data that could not be saved for restoring.
     case clipboardUnsavable
+    /// Clipboard versions changed in a way that cannot be attributed to this copy.
+    case clipboardChanged
+    case clipboardRestoreFailed
+    case modifiersHeld
     /// Copying did not change the clipboard: nothing selected, or the app ignores copy.
     case copyTimedOut
     /// Copying produced no usable text (e.g. only an image was selected).
@@ -77,6 +81,12 @@ public enum CaptureFailure: Error, Equatable, Sendable {
             return "取词期间切换了应用，已停止本次取词。"
         case .clipboardUnsavable:
             return "当前剪贴板内容无法安全保存，已停止自动复制取词，以免丢失剪贴板内容。"
+        case .clipboardChanged:
+            return "取词期间剪贴板发生了其他变化，已保留最新内容。请重新选中文字后重试。"
+        case .clipboardRestoreFailed:
+            return "读取到文字，但恢复剪贴板失败。请检查剪贴板内容后重试。"
+        case .modifiersHeld:
+            return "请松开快捷键的修饰键后重试。"
         case .copyTimedOut:
             return "没有读取到选中的文字。请先选中文字再按快捷键；部分应用不支持取词。"
         case .noText:
@@ -100,6 +110,7 @@ public final class SelectionCapturer {
     private let pasteboard: PasteboardAccess
     private let copyTimeoutMilliseconds: Int
     private let pollMilliseconds: Int
+    private var pendingCopy: (id: UUID, task: Task<CaptureOutcome, Never>)?
 
     public init(environment: SelectionEnvironment, pasteboard: PasteboardAccess,
                 copyTimeoutMilliseconds: Int = 800, pollMilliseconds: Int = 20) {
@@ -111,62 +122,97 @@ public final class SelectionCapturer {
 
     /// - Parameter expectedPID: frontmost app recorded when the hotkey fired.
     public func capture(expectedPID: pid_t?) async -> CaptureOutcome {
+        guard !Task.isCancelled else { return .failure(.cancelled) }
+        // A later capture must not snapshot another capture's temporary clipboard.
+        while let pendingCopy {
+            _ = await pendingCopy.task.value
+            guard !Task.isCancelled else { return .failure(.cancelled) }
+        }
         guard environment.isAccessibilityTrusted() else { return .failure(.permissionDenied) }
         guard let pid = expectedPID ?? environment.frontmostProcessID() else { return .failure(.noFrontmostApp) }
         guard environment.frontmostProcessID() == pid else { return .failure(.frontmostAppChanged) }
 
-        if case .text(let text) = environment.readSelectedText(pid: pid), Self.hasContent(text) {
-            return .success(text: text, method: .accessibility)
+        switch environment.readSelectedText(pid: pid) {
+        case .text(let text):
+            return Self.hasContent(text) ? .success(text: text, method: .accessibility) : .failure(.noText)
+        case .empty:
+            return .failure(.noText)
+        case .unavailable:
+            break
         }
-        return await captureByCopying(pid: pid)
+
+        let id = UUID()
+        let cancellation = CaptureCancellation()
+        // This task owns cleanup after Command-C, even if the caller stops waiting.
+        let task = Task { [self] in
+            defer { if pendingCopy?.id == id { pendingCopy = nil } }
+            return await captureByCopying(pid: pid, cancellation: cancellation)
+        }
+        pendingCopy = (id, task)
+        return await withTaskCancellationHandler {
+            let result = await task.value
+            return Task.isCancelled ? .failure(.cancelled) : result
+        } onCancel: {
+            cancellation.cancel()
+        }
     }
 
-    private func captureByCopying(pid: pid_t) async -> CaptureOutcome {
-        await environment.waitForModifierRelease()
-        if Task.isCancelled { return .failure(.cancelled) }
+    private func captureByCopying(pid: pid_t, cancellation: CaptureCancellation) async -> CaptureOutcome {
+        let released = await environment.waitForModifierRelease()
+        guard !cancellation.isCancelled else { return .failure(.cancelled) }
+        guard released else { return .failure(.modifiersHeld) }
 
-        guard let snapshot = pasteboard.snapshot() else { return .failure(.clipboardUnsavable) }
         let countBefore = pasteboard.changeCount
-        // Re-check right before posting so Command-C never reaches another app.
+        guard let snapshot = pasteboard.snapshot() else { return .failure(.clipboardUnsavable) }
+        guard pasteboard.changeCount == countBefore else { return .failure(.clipboardChanged) }
         guard environment.frontmostProcessID() == pid else { return .failure(.frontmostAppChanged) }
+        guard !cancellation.isCancelled else { return .failure(.cancelled) }
         guard environment.sendCopyCommand() else { return .failure(.copyTimedOut) }
 
         var waited = 0
         var copiedCount: Int?
         var text: String?
+        var appChanged = false
         while waited < copyTimeoutMilliseconds {
             await environment.sleep(milliseconds: pollMilliseconds)
             waited += pollMilliseconds
+            appChanged = appChanged || environment.frontmostProcessID() != pid
 
             let count = pasteboard.changeCount
-            if count != countBefore {
+            if let copiedCount {
+                guard count == copiedCount else { return .failure(.clipboardChanged) }
+            } else if count != countBefore {
+                // shortcut: versions cannot prove the writer, use source attribution if macOS exposes it.
+                guard count == countBefore + 1 else { return .failure(.clipboardChanged) }
                 copiedCount = count
-                text = pasteboard.readString()
             }
-            guard environment.frontmostProcessID() == pid else {
-                if let copiedCount { restoreIfUnchanged(snapshot, expectedCount: copiedCount, countBefore: countBefore) }
-                return .failure(.frontmostAppChanged)
-            }
-            // Apps may clear the pasteboard before writing; keep polling until text arrives.
+            if copiedCount != nil { text = pasteboard.readString() }
+            // Some apps clear the pasteboard before they write the copied text.
             if text != nil { break }
         }
 
-        guard let copiedCount else { return .failure(.copyTimedOut) }
-        restoreIfUnchanged(snapshot, expectedCount: copiedCount, countBefore: countBefore)
-        if Task.isCancelled { return .failure(.cancelled) }
+        guard let copiedCount else {
+            if cancellation.isCancelled { return .failure(.cancelled) }
+            return .failure(appChanged ? .frontmostAppChanged : .copyTimedOut)
+        }
+        if pasteboard.changeCount == copiedCount, !pasteboard.restore(snapshot) {
+            return .failure(.clipboardRestoreFailed)
+        }
+        if cancellation.isCancelled { return .failure(.cancelled) }
+        if appChanged { return .failure(.frontmostAppChanged) }
         guard let text, Self.hasContent(text) else { return .failure(.noText) }
         return .success(text: text, method: .copy)
-    }
-
-    /// Restores only while the clipboard still holds our copy; anything the user
-    /// copied in the meantime is kept.
-    private func restoreIfUnchanged(_ snapshot: PasteboardSnapshot, expectedCount: Int, countBefore: Int) {
-        let count = pasteboard.changeCount
-        guard count != countBefore, count == expectedCount else { return }
-        pasteboard.restore(snapshot)
     }
 
     static func hasContent(_ text: String) -> Bool {
         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
+}
+
+private final class CaptureCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool { lock.withLock { cancelled } }
+    func cancel() { lock.withLock { cancelled = true } }
 }

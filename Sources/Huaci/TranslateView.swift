@@ -29,16 +29,19 @@ final class InputTranslationState: ObservableObject, TranslationPresenter {
 
     func showLoading(requestID: UUID, sourceText: String) {
         content = .loading(sourceText)
+        AccessibilityAnnouncement.post("正在翻译。")
     }
 
     func show(result: TranslationResult, requestID: UUID) {
         copied = false
         isFavorite = isFavoriteResult(result)
         content = .result(result)
+        AccessibilityAnnouncement.post("翻译完成。")
     }
 
     func show(error: FlowError, requestID: UUID) {
         content = .error(error)
+        AccessibilityAnnouncement.post(error.userMessage)
     }
 }
 
@@ -69,6 +72,9 @@ struct TranslateView: View {
             .padding([.horizontal, .bottom], 24)
         }
         .onAppear { editorFocused = true }
+        .onReceive(model.$dataVersion) { _ in
+            if let result = state.result { state.isFavorite = model.isFavorite(result) }
+        }
     }
 
     private var direction: some View {
@@ -99,6 +105,7 @@ struct TranslateView: View {
             }
             .fixedSize()
             .help("目标语言")
+            .accessibilityLabel("目标语言，当前为\(LanguageOption.chineseName(target))")
         }
         .font(.system(size: 12))
     }
@@ -182,10 +189,15 @@ struct TranslateView: View {
                 }
             case .result(let result):
                 ScrollView {
-                    ResultContent(result: result, style: .compact, speak: { speak(result) })
+                    SpeakingResultContent(result: result, speech: model.speech)
                         .padding(EdgeInsets(top: 20, leading: 22, bottom: 20, trailing: 22))
                 }
                 resultActions(result)
+                if let error = model.storeError {
+                    Text(error).font(.caption).foregroundStyle(Theme.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, 18).padding(.bottom, 12)
+                }
             case .error(let error):
                 ScrollView {
                     ErrorCard(presentation: presentation(error), perform: perform, showsReturnHint: false)
@@ -208,24 +220,19 @@ struct TranslateView: View {
             }
             .buttonStyle(ActionButtonStyle())
             if result.kind == .word {
-                Button { state.isFavorite = model.toggleFavorite(result) } label: {
+                Button {
+                    if let isFavorite = model.toggleFavorite(result) { state.isFavorite = isFavorite }
+                } label: {
                     Label(state.isFavorite ? "已收藏" : "收藏", systemImage: state.isFavorite ? "star.fill" : "star")
                 }
                 .buttonStyle(ActionButtonStyle(tint: state.isFavorite ? Theme.favorite : .primary))
             }
-            Button { speak(result) } label: {
-                Label(result.kind == .word ? "朗读" : "朗读原文", systemImage: "speaker.wave.2")
-            }
-            .buttonStyle(ActionButtonStyle())
+            SpeechActionButton(result: result, speech: model.speech)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 10)
         .frame(height: 52)
         .overlay(alignment: .top) { Divider() }
-    }
-
-    private func speak(_ result: TranslationResult) {
-        model.speech.speak(result.word?.headword ?? result.sourceText, language: result.sourceLanguage)
     }
 
     private func presentation(_ error: FlowError) -> ErrorPresentation {

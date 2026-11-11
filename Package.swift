@@ -20,6 +20,10 @@ let package = Package(
             name: "HuaciCoreTests",
             dependencies: ["HuaciCore"]
         ),
+        .testTarget(
+            name: "HuaciTests",
+            dependencies: ["Huaci"]
+        ),
     ],
     swiftLanguageModes: [.v5]
 )

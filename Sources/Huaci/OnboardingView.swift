@@ -227,6 +227,7 @@ private struct OnboardingServiceRow: View {
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var settings: AppSettings
     @State private var signInTask: Task<Void, Never>?
+    @State private var signInID: UUID?
     @State private var signInError: String?
 
     private var selected: Bool { settings.activeService == service }
@@ -275,7 +276,17 @@ private struct OnboardingServiceRow: View {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(selected ? Theme.accent : Color(nsColor: .separatorColor), lineWidth: selected ? 2 : 1)
         )
-        .onDisappear { signInTask?.cancel() }
+        .onChange(of: selected) { selected in
+            if !selected { cancelSignIn() }
+        }
+        .onDisappear { cancelSignIn() }
+    }
+
+    private func cancelSignIn() {
+        signInTask?.cancel()
+        signInTask = nil
+        signInID = nil
+        signInError = nil
     }
 
     @ViewBuilder
@@ -310,15 +321,23 @@ private struct OnboardingServiceRow: View {
 
     private func signIn() {
         signInError = nil
+        let id = UUID()
+        signInID = id
         signInTask = Task {
+            defer {
+                if signInID == id {
+                    signInTask = nil
+                    signInID = nil
+                }
+            }
             do {
                 try await model.signIn(service)
             } catch TranslationError.cancelled {
                 // Cancelled by the user or the window closing.
             } catch {
+                guard signInID == id, selected, !Task.isCancelled else { return }
                 signInError = (error as? TranslationError)?.userMessage ?? error.localizedDescription
             }
-            signInTask = nil
         }
     }
 }

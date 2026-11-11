@@ -71,6 +71,16 @@ extension TranslationService {
     var usesOAuth: Bool { self != .personalAPI }
 }
 
+@MainActor
+enum AccessibilityAnnouncement {
+    static func post(_ text: String) {
+        guard let app = NSApp else { return }
+        NSAccessibility.post(element: app, notification: .announcementRequested, userInfo: [
+            .announcement: text, .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+        ])
+    }
+}
+
 enum Pasteboard {
     static func copy(_ text: String) {
         NSPasteboard.general.clearContents()
@@ -223,16 +233,24 @@ struct ShortcutHint: View {
 /// Placeholder bar shown while a result loads; pulses on a timeline so the
 /// surrounding layout never animates.
 struct SkeletonBar: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var width: CGFloat?
     var height: CGFloat = 12
 
     var body: some View {
-        TimelineView(.animation) { context in
-            let phase = context.date.timeIntervalSinceReferenceDate * .pi / 0.9
-            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                .fill(Theme.chip)
-                .opacity(0.78 + 0.22 * cos(phase))
+        Group {
+            if reduceMotion {
+                RoundedRectangle(cornerRadius: 4, style: .continuous).fill(Theme.chip)
+            } else {
+                TimelineView(.animation) { context in
+                    let phase = context.date.timeIntervalSinceReferenceDate * .pi / 0.9
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(Theme.chip)
+                        .opacity(0.78 + 0.22 * cos(phase))
+                }
+            }
         }
+        .accessibilityHidden(true)
         .frame(width: width, height: height)
         .frame(maxWidth: width == nil ? .infinity : nil, alignment: .leading)
     }

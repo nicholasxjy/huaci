@@ -46,6 +46,48 @@ struct PopupPositionerTests {
         #expect(frame == small)
     }
 
+    @Test func pinnedResizePreservesTopEdgeWhenItFits() {
+        let previous = CGRect(x: 200, y: 300, width: 380, height: 200)
+        let frame = PopupPositioner.pinnedFrame(size: size, previous: previous, screens: [main, left])
+        #expect(frame == CGRect(x: 200, y: 200, width: 380, height: 300))
+    }
+
+    @Test func pinnedResizeClampsAtEveryScreenEdge() {
+        for screen in [main, left] {
+            for origin in [CGPoint(x: screen.minX, y: screen.minY), CGPoint(x: screen.maxX - 100, y: screen.maxY - 100)] {
+                let previous = CGRect(origin: origin, size: CGSize(width: 100, height: 100))
+                let frame = PopupPositioner.pinnedFrame(size: size, previous: previous, screens: [main, left])
+                #expect(isInside(frame, screen))
+            }
+        }
+    }
+
+    @Test func pinnedResizeUsesLargestOverlapRatherThanTopLeftDisplay() {
+        let previous = CGRect(x: -50, y: 400, width: 400, height: 300)
+        let frame = PopupPositioner.pinnedFrame(size: size, previous: previous, screens: [main, left])
+        #expect(isInside(frame, main))
+        #expect(frame.minX == 0)
+    }
+
+    @Test func pinnedResizeRecoversAfterDisplayRemoval() {
+        let previous = CGRect(x: -1500, y: 200, width: 380, height: 300)
+        let frame = PopupPositioner.pinnedFrame(size: size, previous: previous, screens: [main])
+        #expect(isInside(frame, main))
+        #expect(frame.minX == main.minX)
+    }
+
+    @Test func pinnedResizeShrinksToAvailableScreen() {
+        let small = CGRect(x: -300, y: -200, width: 300, height: 200)
+        let previous = CGRect(x: -200, y: -100, width: 100, height: 100)
+        #expect(PopupPositioner.pinnedFrame(size: size, previous: previous, screens: [small]) == small)
+    }
+
+    @Test func pinnedResizeWithoutScreensKeepsTopEdge() {
+        let previous = CGRect(x: -100, y: 20, width: 200, height: 100)
+        let frame = PopupPositioner.pinnedFrame(size: size, previous: previous, screens: [])
+        #expect(frame == CGRect(x: -100, y: -180, width: 380, height: 300))
+    }
+
     @Test func mouseBetweenScreensUsesNearest() {
         let frame = PopupPositioner.frame(size: size, mouse: CGPoint(x: 1500, y: 400), screens: [main, left])
         #expect(isInside(frame, main))

@@ -1,13 +1,15 @@
 import Foundation
 
-/// A model a service offers, as reported by its model list endpoint.
+/// A server-listed model or a local suggestion when no chat models are listed.
 public struct RemoteModel: Equatable, Hashable, Identifiable, Sendable {
     public let id: String
     public let displayName: String?
+    public let isSuggested: Bool
 
-    public init(id: String, displayName: String? = nil) {
+    public init(id: String, displayName: String? = nil, isSuggested: Bool = false) {
         self.id = id
         self.displayName = displayName
+        self.isSuggested = isSuggested
     }
 }
 
@@ -77,7 +79,7 @@ public enum ModelCatalog {
                                    backend: AntigravityBackend = .live) async throws -> [RemoteModel] {
         let tokens = try await auth.validTokens()
         let project = try await AntigravityAuth.project(accessToken: tokens.accessToken, storedID: tokens.projectID,
-                                                        session: session, backend: backend)
+                                                        session: session, backend: backend, auth: auth)
         let url = backend.url(backend.base, "fetchAvailableModels")
         let userAgent = backend.userAgent(version: await backend.version())
 
@@ -98,10 +100,8 @@ public enum ModelCatalog {
                     return request
                 }
                 break
-            } catch TranslationError.cancelled {
-                throw TranslationError.cancelled
-            } catch {
-                lastError = error
+            } catch TranslationError.http(400, let message) where tier != nil && Self.isEntitlementRejection(message) {
+                lastError = TranslationError.http(status: 400, message: message)
             }
         }
         guard let reply else { throw lastError }
@@ -131,7 +131,18 @@ public enum ModelCatalog {
                 case (nil, nil): return a.id < b.id
                 }
             }
-        return models.isEmpty ? antigravityModels : models
+        if models.isEmpty {
+            return antigravityModels.map { RemoteModel(id: $0.id, displayName: $0.displayName, isSuggested: true) }
+        }
+        return models
+    }
+
+    /// A different tier cannot repair quota, transport, authentication, or unrelated request errors.
+    private static func isEntitlementRejection(_ message: String?) -> Bool {
+        let message = message?.lowercased() ?? ""
+        return (message.contains("entitlement") || message.contains("usertier") || message.contains("user tier"))
+            && ["invalid", "reject", "not supported", "unsupported", "not allowed", "not eligible", "failed_precondition"]
+                .contains(where: message.contains)
     }
 
     /// The models Antigravity offers, for when it doesn't say.

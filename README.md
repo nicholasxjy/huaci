@@ -31,4 +31,4 @@ open build/Huaci.app
 - ad-hoc 签名每次重新构建都会变化，需要在系统设置中重新勾选辅助功能权限。
 - API Key 与 OAuth 令牌只保存在本机钥匙串；历史、生词本与翻译缓存保存在 `~/Library/Application Support/Huaci/huaci.sqlite`。
 
-需求与实现方案见 [docs/mvp-plan.md](docs/mvp-plan.md)，跨应用实测清单见 [docs/compatibility.md](docs/compatibility.md)。
+需求与实现方案见 [docs/mvp-plan.md](docs/mvp-plan.md)，跨应用实测清单见 [docs/compatibility.md](docs/compatibility.md)。状态机清单、异步操作约定与回归验证见 [docs/state-machines.md](docs/state-machines.md)。

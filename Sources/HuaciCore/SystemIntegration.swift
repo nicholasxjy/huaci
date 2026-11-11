@@ -31,16 +31,18 @@ public final class SystemPasteboard: PasteboardAccess {
         return PasteboardSnapshot(items: items)
     }
 
-    public func restore(_ snapshot: PasteboardSnapshot) {
-        pasteboard.clearContents()
-        let items = snapshot.items.map { entries -> NSPasteboardItem in
+    @discardableResult
+    public func restore(_ snapshot: PasteboardSnapshot) -> Bool {
+        var items: [NSPasteboardItem] = []
+        for entries in snapshot.items {
             let item = NSPasteboardItem()
             for entry in entries {
-                item.setData(entry.data, forType: NSPasteboard.PasteboardType(entry.type))
+                guard item.setData(entry.data, forType: NSPasteboard.PasteboardType(entry.type)) else { return false }
             }
-            return item
+            items.append(item)
         }
-        if !items.isEmpty { pasteboard.writeObjects(items) }
+        pasteboard.clearContents()
+        return items.isEmpty || pasteboard.writeObjects(items)
     }
 
     public func readString() -> String? {
@@ -74,21 +76,23 @@ public final class SystemSelectionEnvironment: SelectionEnvironment {
         var value: CFTypeRef?
         switch AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute as CFString, &value) {
         case .success:
-            guard let text = value as? String else { return .empty }
+            guard let text = value as? String else { return .unavailable }
             return text.isEmpty ? .empty : .text(text)
         case .noValue, .attributeUnsupported:
-            return .empty
+            return .unavailable
         default:
             return .unavailable
         }
     }
 
-    public func waitForModifierRelease() async {
+    public func waitForModifierRelease() async -> Bool {
         let held: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
         for _ in 0..<25 {
-            if CGEventSource.flagsState(.combinedSessionState).intersection(held).isEmpty { return }
+            if Task.isCancelled { return false }
+            if CGEventSource.flagsState(.combinedSessionState).intersection(held).isEmpty { return true }
             await sleep(milliseconds: 20)
         }
+        return CGEventSource.flagsState(.combinedSessionState).intersection(held).isEmpty
     }
 
     public func sendCopyCommand() -> Bool {

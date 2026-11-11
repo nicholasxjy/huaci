@@ -204,7 +204,46 @@ private struct RuleLabel: View {
 
 // MARK: - Data
 
-private struct DataSettings: View {
+struct StorageDataState {
+    struct Counts {
+        let history: Int
+        let favorites: Int
+        let cache: Int
+    }
+
+    private(set) var counts: Counts?
+    private(set) var error: String?
+
+    mutating func reload(store: HistoryStore?) {
+        do {
+            let store = try requireStore(store)
+            counts = Counts(history: try store.historyCount(), favorites: try store.favoritesCount(),
+                            cache: try store.translationCacheCount())
+            error = nil
+        } catch {
+            counts = nil
+            self.error = "无法读取数据数量：\(error.localizedDescription)"
+        }
+    }
+
+    mutating func clear(_ target: DataSettings.ClearTarget, store: HistoryStore?) -> Bool {
+        do {
+            let store = try requireStore(store)
+            switch target {
+            case .history: try store.clearHistory()
+            case .favorites: try store.clearFavorites()
+            case .cache: try store.clearTranslationCache()
+            }
+            error = nil
+            return true
+        } catch {
+            self.error = "清除失败，请重试读取以核实数据：\(error.localizedDescription)"
+            return false
+        }
+    }
+}
+
+struct DataSettings: View {
     enum ClearTarget: String, Identifiable {
         case history, favorites, cache
         var id: String { rawValue }
@@ -227,24 +266,31 @@ private struct DataSettings: View {
     }
 
     @EnvironmentObject private var model: AppModel
-    @State private var historyCount = 0
-    @State private var favoritesCount = 0
-    @State private var cacheCount = 0
+    @State private var storage = StorageDataState()
     @State private var clearTarget: ClearTarget?
 
     var body: some View {
         Form {
             Section("本机数据") {
-                row("查询历史", "\(historyCount) 条") {
+                row("查询历史", storage.counts.map { "\($0.history) 条" } ?? "数量暂不可用") {
                     Button("查看") { WindowRouter.shared.showMain(.history) }
-                    Button("清空…", role: .destructive) { clearTarget = .history }.disabled(historyCount == 0)
+                    Button("清空…", role: .destructive) { clearTarget = .history }.disabled(model.store == nil || storage.counts?.history == 0)
                 }
-                row("生词本", "\(favoritesCount) 个") {
+                row("生词本", storage.counts.map { "\($0.favorites) 个" } ?? "数量暂不可用") {
                     Button("查看") { WindowRouter.shared.showMain(.vocabulary) }
-                    Button("清空…", role: .destructive) { clearTarget = .favorites }.disabled(favoritesCount == 0)
+                    Button("清空…", role: .destructive) { clearTarget = .favorites }.disabled(model.store == nil || storage.counts?.favorites == 0)
                 }
-                row("翻译缓存", "\(cacheCount.formatted()) 条 · 相同内容再次查询时直接使用") {
-                    Button("清除…", role: .destructive) { clearTarget = .cache }.disabled(cacheCount == 0)
+                row("翻译缓存", storage.counts.map { "\($0.cache.formatted()) 条 · 相同内容再次查询时直接使用" } ?? "数量暂不可用") {
+                    Button("清除…", role: .destructive) { clearTarget = .cache }.disabled(model.store == nil || storage.counts?.cache == 0)
+                }
+            }
+            Section {
+                Footnote(text: "数量按已保存的记录统计，包含无法读取的记录。查询历史、生词本与缓存分别清除，互不影响。")
+            }
+            if let error = storage.error {
+                Section {
+                    Text(error).foregroundStyle(Theme.danger).textSelection(.enabled)
+                    Button("重试读取", action: reload)
                 }
             }
             if let url = model.store?.url {
@@ -291,18 +337,13 @@ private struct DataSettings: View {
     }
 
     private func clear(_ target: ClearTarget) {
-        switch target {
-        case .history: try? model.store?.clearHistory()
-        case .favorites: try? model.store?.clearFavorites()
-        case .cache: model.clearTranslationCache()
+        if storage.clear(target, store: model.store) {
+            model.dataChanged()
         }
-        model.dataChanged()
     }
 
     private func reload() {
-        historyCount = (try? model.store?.historyCount()) ?? 0
-        favoritesCount = (try? model.store?.favoritesCount()) ?? 0
-        cacheCount = (try? model.store?.translationCacheCount()) ?? 0
+        storage.reload(store: model.store)
     }
 }
 

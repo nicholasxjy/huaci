@@ -20,6 +20,7 @@ struct WordEntryView: View {
     let word: WordEntry
     var style: ResultStyle = .compact
     var speak: (() -> Void)?
+    var isSpeaking = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -31,8 +32,8 @@ struct WordEntryView: View {
                 if let speak {
                     Button(action: speak) {
                         HStack(spacing: 6) {
-                            Image(systemName: "speaker.wave.2.fill").font(.system(size: 11))
-                            if let phonetic = word.phonetic { Text(phonetic) } else { Text("朗读") }
+                            Image(systemName: isSpeaking ? "stop.fill" : "speaker.wave.2.fill").font(.system(size: 11))
+                            if isSpeaking { Text("停止朗读") } else if let phonetic = word.phonetic { Text(phonetic) } else { Text("朗读") }
                         }
                         .font(.system(size: style == .compact ? 13 : 14))
                         .foregroundStyle(Theme.accentText)
@@ -42,8 +43,8 @@ struct WordEntryView: View {
                         .contentShape(Capsule())
                     }
                     .buttonStyle(.plain)
-                    .help("朗读")
-                    .accessibilityLabel("朗读 \(word.headword)")
+                    .help(isSpeaking ? "停止朗读" : "朗读")
+                    .accessibilityLabel(isSpeaking ? "停止朗读" : "朗读 \(word.headword)")
                 } else if let phonetic = word.phonetic {
                     Text(phonetic).font(.system(size: style.secondary)).foregroundStyle(.secondary)
                 }
@@ -181,13 +182,43 @@ struct ResultContent: View {
     let result: TranslationResult
     var style: ResultStyle = .compact
     var speak: (() -> Void)?
+    var isSpeaking = false
 
     var body: some View {
         if result.kind == .word, let word = result.word {
-            WordEntryView(result: result, word: word, style: style, speak: speak)
+            WordEntryView(result: result, word: word, style: style, speak: speak, isSpeaking: isSpeaking)
         } else {
             TextTranslationView(result: result, style: style)
         }
+    }
+}
+
+/// Observes speech independently of the app model so completion updates controls.
+struct SpeakingResultContent: View {
+    let result: TranslationResult
+    @ObservedObject var speech: Speech
+
+    var body: some View {
+        ResultContent(result: result, speak: { speech.toggle(result) }, isSpeaking: speech.isSpeaking(result))
+    }
+}
+
+struct SpeechActionButton: View {
+    let result: TranslationResult
+    @ObservedObject var speech: Speech
+    var shortcut: String?
+
+    var body: some View {
+        Button { speech.toggle(result) } label: {
+            HStack(spacing: 6) {
+                Label(speech.isSpeaking(result) ? "停止" : (result.kind == .word ? "朗读" : "朗读原文"),
+                      systemImage: speech.isSpeaking(result) ? "stop.fill" : "speaker.wave.2")
+                if let shortcut { ShortcutHint(text: shortcut) }
+            }
+        }
+        .buttonStyle(ActionButtonStyle())
+        .help(speech.isSpeaking(result) ? "停止朗读" : "朗读原文")
+        .accessibilityLabel(speech.isSpeaking(result) ? "停止朗读" : "朗读原文")
     }
 }
 

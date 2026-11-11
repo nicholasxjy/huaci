@@ -4,6 +4,7 @@ import Testing
 
 final class MemoryCredentialStore: CredentialStore, @unchecked Sendable {
     var tokens: OAuthTokens?
+    var allowsSaving = true
 
     init(_ tokens: OAuthTokens? = nil) {
         self.tokens = tokens
@@ -13,6 +14,7 @@ final class MemoryCredentialStore: CredentialStore, @unchecked Sendable {
 
     @discardableResult
     func save(_ tokens: OAuthTokens) -> Bool {
+        guard allowsSaving else { return false }
         self.tokens = tokens
         return true
     }
@@ -175,15 +177,27 @@ extension TranslatorTests {
             #expect(PKCE(verifier: verifier).challenge == challenge.value)
         }
 
-        @Test func signInRejectsMismatchedState() async throws {
+        @Test(.timeLimit(.minutes(1))) func staleCallbackDoesNotConsumeTheCurrentSignIn() async throws {
             let store = MemoryCredentialStore()
             let auth = OAuthSession(provider: Self.provider, store: store, session: StubURLProtocol.session([tokenReply]))
+            let browser = Self.browser { "code=current&state=\($0["state"]!)" }
 
-            await #expect(throws: TranslationError.self) {
-                try await auth.signIn(open: Self.browser { _ in "code=code-1&state=forged" })
+            let tokens = try await auth.signIn { url in
+                let params = queryItems(url)
+                let staleURL = URL(string: "\(params["redirect_uri"]!)?code=stale&state=previous-attempt")!
+                do {
+                    let (_, response) = try await URLSession(configuration: .ephemeral).data(from: staleURL)
+                    #expect((response as? HTTPURLResponse)?.statusCode == 404)
+                } catch { Issue.record(error) }
+                #expect(StubURLProtocol.requests.isEmpty)
+                #expect(store.tokens == nil)
+                await browser(url)
             }
-            #expect(StubURLProtocol.requests.isEmpty)
-            #expect(store.tokens == nil)
+
+            #expect(tokens.accessToken == "at-1")
+            #expect(store.tokens == tokens)
+            #expect(StubURLProtocol.requests.count == 1)
+            #expect(formBody(0)["code"] == "current")
         }
 
         @Test func signInReportsDeniedAuthorization() async throws {
@@ -203,6 +217,60 @@ extension TranslatorTests {
             try await Task.sleep(nanoseconds: 200_000_000)
             task.cancel()
             await #expect(throws: TranslationError.cancelled) { try await task.value }
+        }
+
+        @Test(arguments: [false, true])
+        func abandonedSignInCannotSaveTokens(cancelTask: Bool) async throws {
+            let gate = OAuthGate()
+            let provider = OAuthProvider(
+                name: "Test", authorizeURL: Self.provider.authorizeURL, tokenURL: Self.provider.tokenURL,
+                clientID: "client-1", clientSecret: nil, scopes: [], callbackPort: 0, callbackPath: "/cb",
+                resolveAccount: { _, _ in
+                    await gate.wait()
+                    return OAuthAccount(email: "user@example.com")
+                }
+            )
+            let store = MemoryCredentialStore()
+            let auth = OAuthSession(provider: provider, store: store, session: StubURLProtocol.session([tokenReply]))
+            let task = Task { try await auth.signIn(open: Self.browser { "code=c&state=\($0["state"]!)" }) }
+            await gate.waitUntilEntered()
+
+            if cancelTask { task.cancel() } else { await auth.signOut() }
+            await gate.release()
+
+            await #expect(throws: TranslationError.cancelled) { try await task.value }
+            #expect(store.tokens == nil)
+        }
+
+        @Test func replacedSignInCannotClearNewAttempt() async throws {
+            let firstAccount = OAuthGate()
+            let secondAccount = OAuthGate()
+            let provider = OAuthProvider(
+                name: "Test", authorizeURL: Self.provider.authorizeURL, tokenURL: Self.provider.tokenURL,
+                clientID: "client-1", clientSecret: nil, scopes: [], callbackPort: 0, callbackPath: "/cb",
+                resolveAccount: { response, _ in
+                    if response.accessToken == "at-1" { await firstAccount.wait() }
+                    else { await secondAccount.wait() }
+                    return OAuthAccount(email: "user@example.com")
+                }
+            )
+            let store = MemoryCredentialStore()
+            let auth = OAuthSession(provider: provider, store: store, session: StubURLProtocol.session([
+                tokenReply,
+                .init(status: 200, body: #"{"access_token":"at-2","refresh_token":"rt-2","expires_in":3600}"#),
+            ]))
+            let browser = Self.browser { "code=c&state=\($0["state"]!)" }
+            let first = Task { try await auth.signIn(open: browser) }
+            await firstAccount.waitUntilEntered()
+            let second = Task { try await auth.signIn(open: browser) }
+            await secondAccount.waitUntilEntered()
+
+            await firstAccount.release()
+            await #expect(throws: TranslationError.cancelled) { try await first.value }
+            await secondAccount.release()
+
+            #expect(try await second.value.accessToken == "at-2")
+            #expect(store.tokens?.accessToken == "at-2")
         }
 
         @Test func signInWithoutClientFailsBeforeOpeningBrowser() async throws {
@@ -283,12 +351,102 @@ extension TranslatorTests {
             }
         }
 
+        @Test func signOutCancelsReplacementRefresh() async throws {
+            for _ in 0..<20 {
+                let firstReply = OAuthGate()
+                let secondReply = OAuthGate()
+                let expired = OAuthTokens(accessToken: "old", refreshToken: "rt", expiresAt: .distantPast)
+                let store = MemoryCredentialStore(expired)
+                let session = StubURLProtocol.session([
+                    .init(status: 200, body: #"{"access_token":"first","expires_in":3600}"#,
+                          beforeReply: { await firstReply.wait() }),
+                    .init(status: 200, body: #"{"access_token":"second","expires_in":3600}"#,
+                          beforeReply: { await secondReply.wait() }),
+                ])
+                let auth = OAuthSession(provider: Self.provider, store: store, session: session)
+                let first = Task(priority: .background) { try await auth.validTokens() }
+                await firstReply.waitUntilEntered()
+
+                await auth.signOut()
+                store.save(expired)
+                let second = Task(priority: .high) { try await auth.validTokens() }
+                await secondReply.waitUntilEntered()
+                await #expect(throws: TranslationError.cancelled) { try await first.value }
+
+                await auth.signOut()
+                await firstReply.release()
+                await secondReply.release()
+                await #expect(throws: TranslationError.cancelled) { try await second.value }
+                #expect(store.tokens == nil)
+            }
+        }
+
+        @Test func failedRefreshPersistenceIsReportedAndRetriedWithoutTokenExchange() async throws {
+            let old = OAuthTokens(accessToken: "old", refreshToken: "old-rt", expiresAt: .distantPast)
+            let store = MemoryCredentialStore(old)
+            store.allowsSaving = false
+            let auth = OAuthSession(provider: Self.provider, store: store, session: StubURLProtocol.session([
+                .init(status: 200, body: #"{"access_token":"rotated","refresh_token":"new-rt","expires_in":3600}"#),
+            ]))
+
+            await #expect(throws: TranslationError.self) { try await auth.validTokens() }
+            #expect(store.tokens == old)
+            store.allowsSaving = true
+            let recovered = try await auth.validTokens()
+
+            #expect(recovered.accessToken == "rotated")
+            #expect(recovered.refreshToken == "new-rt")
+            #expect(store.tokens == recovered)
+            #expect(StubURLProtocol.requests.count == 1)
+        }
+
+        @Test func signOutDiscardsUnsavedRefreshedTokens() async throws {
+            let old = OAuthTokens(accessToken: "old", refreshToken: "old-rt", expiresAt: .distantPast)
+            let store = MemoryCredentialStore(old)
+            store.allowsSaving = false
+            let auth = OAuthSession(provider: Self.provider, store: store, session: StubURLProtocol.session([
+                .init(status: 200, body: #"{"access_token":"rotated","refresh_token":"new-rt","expires_in":3600}"#),
+            ]))
+            await #expect(throws: TranslationError.self) { try await auth.validTokens() }
+
+            await auth.signOut()
+            store.allowsSaving = true
+
+            await #expect(throws: TranslationError.notConfigured("请先在设置中登录 Test。")) { try await auth.validTokens() }
+            #expect(store.tokens == nil)
+            #expect(StubURLProtocol.requests.count == 1)
+        }
+
         @Test func signOutClearsTokens() async throws {
             let store = MemoryCredentialStore(OAuthTokens(accessToken: "at", refreshToken: "rt", expiresAt: .distantFuture))
             let auth = OAuthSession(provider: Self.provider, store: store, session: StubURLProtocol.session([]))
             await auth.signOut()
             #expect(store.tokens == nil)
         }
+    }
+}
+
+/// Suspends an OAuth step until the test releases it, independently of cancellation.
+private actor OAuthGate {
+    private var entered = false
+    private var started: CheckedContinuation<Void, Never>?
+    private var pending: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        entered = true
+        started?.resume()
+        started = nil
+        await withCheckedContinuation { pending = $0 }
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { started = $0 }
+    }
+
+    func release() {
+        pending?.resume()
+        pending = nil
     }
 }
 

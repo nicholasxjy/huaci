@@ -21,8 +21,31 @@ public enum FavoriteOrder: String, CaseIterable, Sendable {
     case alphabetical
 }
 
-public enum StoreError: Error, Equatable {
+public enum StoreError: Error, Equatable, LocalizedError {
     case sqlite(String)
+    case decoding(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .sqlite(let message), .decoding(let message): return message
+        }
+    }
+}
+
+/// Healthy rows remain available; warnings identify unreadable rows left untouched on disk.
+public struct StoreReadResult<Item> {
+    public let items: [Item]
+    public let warnings: [String]
+
+    public init(items: [Item], warnings: [String] = []) {
+        self.items = items
+        self.warnings = warnings
+    }
+
+    fileprivate func validated() throws -> [Item] {
+        guard warnings.isEmpty else { throw StoreError.decoding(warnings.joined(separator: "\n")) }
+        return items
+    }
 }
 
 /// Local SQLite store for query history, saved words and cached translations.
@@ -49,7 +72,13 @@ public final class HistoryStore: @unchecked Sendable {
             sqlite3_close(db)
             throw StoreError.sqlite(message)
         }
-        try migrate()
+        do {
+            try migrate()
+        } catch {
+            sqlite3_close(db)
+            db = nil
+            throw error
+        }
     }
 
     deinit {
@@ -68,6 +97,10 @@ public final class HistoryStore: @unchecked Sendable {
     }
 
     public func history(search: String? = nil, limit: Int = 500) throws -> [HistoryItem] {
+        try historySnapshot(search: search, limit: limit).validated()
+    }
+
+    public func historySnapshot(search: String? = nil, limit: Int = 500) throws -> StoreReadResult<HistoryItem> {
         var sql = "SELECT id, payload, created_at FROM history"
         var params: [Value] = []
         if let pattern = Self.likePattern(search) {
@@ -76,9 +109,8 @@ public final class HistoryStore: @unchecked Sendable {
         }
         sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
         params.append(.int(Int64(limit)))
-        return try query(sql, params) { row in
-            guard let result = try? self.decode(row.text(1)) else { return nil }
-            return HistoryItem(id: row.int(0), result: result, createdAt: Date(timeIntervalSince1970: row.real(2)))
+        return try readRecords(sql, params, table: "history") { row, result in
+            HistoryItem(id: row.int(0), result: result, createdAt: Date(timeIntervalSince1970: row.real(2)))
         }
     }
 
@@ -130,6 +162,10 @@ public final class HistoryStore: @unchecked Sendable {
     }
 
     public func favorites(search: String? = nil, order: FavoriteOrder = .recent) throws -> [FavoriteItem] {
+        try favoritesSnapshot(search: search, order: order).validated()
+    }
+
+    public func favoritesSnapshot(search: String? = nil, order: FavoriteOrder = .recent) throws -> StoreReadResult<FavoriteItem> {
         var sql = "SELECT id, payload, created_at FROM favorites"
         var params: [Value] = []
         if let pattern = Self.likePattern(search) {
@@ -140,9 +176,8 @@ public final class HistoryStore: @unchecked Sendable {
         case .recent: sql += " ORDER BY created_at DESC, id DESC"
         case .alphabetical: sql += " ORDER BY headword COLLATE NOCASE, id"
         }
-        return try query(sql, params) { row in
-            guard let result = try? self.decode(row.text(1)) else { return nil }
-            return FavoriteItem(id: row.int(0), result: result, createdAt: Date(timeIntervalSince1970: row.real(2)))
+        return try readRecords(sql, params, table: "favorites") { row, result in
+            FavoriteItem(id: row.int(0), result: result, createdAt: Date(timeIntervalSince1970: row.real(2)))
         }
     }
 
@@ -150,11 +185,12 @@ public final class HistoryStore: @unchecked Sendable {
 
     /// Translations keyed by the exact request text, kind and target language,
     /// so a repeated lookup does not call the model again.
+    /// Unreadable entries throw; optional-cache callers can fetch a fresh result and replace them.
     public func cachedResult(for request: TranslationRequest) throws -> TranslationResult? {
         try query(
             "SELECT payload FROM translation_cache WHERE source_text = ? AND kind = ? AND target_language = ?",
             [.text(request.text), .text(request.kind.rawValue), .text(request.targetLanguage.code)]
-        ) { row in try? self.decode(row.text(0)) }.first
+        ) { row in try self.decode(row.text(0)) }.first
     }
 
     public func cache(_ result: TranslationResult, for request: TranslationRequest, at date: Date = Date()) throws {
@@ -188,12 +224,32 @@ public final class HistoryStore: @unchecked Sendable {
         let statement: OpaquePointer
         func int(_ index: Int32) -> Int64 { sqlite3_column_int64(statement, index) }
         func real(_ index: Int32) -> Double { sqlite3_column_double(statement, index) }
-        func text(_ index: Int32) -> String {
-            sqlite3_column_text(statement, index).map { String(cString: $0) } ?? ""
+        func text(_ index: Int32) throws -> String {
+            guard let bytes = sqlite3_column_text(statement, index) else {
+                throw StoreError.decoding("Missing text in column \(index)")
+            }
+            let buffer = UnsafeBufferPointer(start: bytes, count: Int(sqlite3_column_bytes(statement, index)))
+            guard let value = String(bytes: buffer, encoding: .utf8) else {
+                throw StoreError.decoding("Invalid UTF-8 in column \(index)")
+            }
+            return value
         }
     }
 
     private func migrate() throws {
+        let version = try query("PRAGMA user_version", []) { $0.int(0) }.first ?? 0
+        guard version < 2 else { return }
+        try exec("BEGIN IMMEDIATE")
+        do {
+            try migrateSchema()
+            try exec("COMMIT")
+        } catch {
+            try? exec("ROLLBACK")
+            throw error
+        }
+    }
+
+    private func migrateSchema() throws {
         let version = try query("PRAGMA user_version", []) { $0.int(0) }.first ?? 0
         if version < 1 {
             try exec("""
@@ -264,19 +320,51 @@ public final class HistoryStore: @unchecked Sendable {
         return rows
     }
 
-    private func prepare(_ sql: String, _ params: [Value]) throws -> OpaquePointer {
+    func prepare(_ sql: String, _ params: [Value]) throws -> OpaquePointer {
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { throw lastError() }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            let error = lastError()
+            sqlite3_finalize(statement)
+            throw error
+        }
+        var prepared = false
+        defer { if !prepared { sqlite3_finalize(statement) } }
         let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         for (offset, param) in params.enumerated() {
             let index = Int32(offset + 1)
+            let status: Int32
             switch param {
-            case .text(let value): sqlite3_bind_text(statement, index, value, -1, transient)
-            case .int(let value): sqlite3_bind_int64(statement, index, value)
-            case .real(let value): sqlite3_bind_double(statement, index, value)
+            case .text(let value):
+                let bytes = value.utf8CString
+                guard let length = Int32(exactly: bytes.count - 1) else {
+                    throw StoreError.sqlite("Text exceeds SQLite's supported byte length")
+                }
+                status = bytes.withUnsafeBufferPointer {
+                    sqlite3_bind_text(statement, index, $0.baseAddress, length, transient)
+                }
+            case .int(let value): status = sqlite3_bind_int64(statement, index, value)
+            case .real(let value): status = sqlite3_bind_double(statement, index, value)
             }
+            guard status == SQLITE_OK else { throw lastError() }
         }
+        prepared = true
         return statement
+    }
+
+    private func readRecords<Item>(_ sql: String, _ params: [Value], table: String,
+                                   make: (Row, TranslationResult) -> Item) throws -> StoreReadResult<Item> {
+        var warnings: [String] = []
+        let items: [Item] = try query(sql, params) { row in
+            let result: TranslationResult
+            do {
+                result = try self.decode(row.text(1))
+            } catch {
+                warnings.append("\(table) #\(row.int(0)): \(error.localizedDescription)")
+                return nil
+            }
+            return make(row, result)
+        }
+        return StoreReadResult(items: items, warnings: warnings)
     }
 
     private func lastError() -> StoreError {

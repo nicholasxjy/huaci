@@ -8,6 +8,7 @@ final class StubURLProtocol: URLProtocol {
     struct Reply {
         var status: Int
         var body: String
+        var beforeReply: (@Sendable () async -> Void)? = nil
     }
 
     nonisolated(unsafe) static var replies: [Reply] = []
@@ -28,16 +29,30 @@ final class StubURLProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
+    private var delivery: Task<Void, Never>?
+
     override func startLoading() {
         Self.requests.append((request, Self.readBody(request)))
         let reply = Self.replies.isEmpty ? Reply(status: 500, body: "") : Self.replies.removeFirst()
+        if let beforeReply = reply.beforeReply {
+            delivery = Task {
+                await beforeReply()
+                guard !Task.isCancelled else { return }
+                self.respond(reply)
+            }
+        } else {
+            respond(reply)
+        }
+    }
+
+    private func respond(_ reply: Reply) {
         let response = HTTPURLResponse(url: request.url!, statusCode: reply.status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(reply.body.utf8))
         client?.urlProtocolDidFinishLoading(self)
     }
 
-    override func stopLoading() {}
+    override func stopLoading() { delivery?.cancel() }
 
     private static func readBody(_ request: URLRequest) -> Data {
         if let body = request.httpBody { return body }

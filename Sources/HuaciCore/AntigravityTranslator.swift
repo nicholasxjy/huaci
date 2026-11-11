@@ -43,15 +43,20 @@ public enum AntigravityAuth {
     /// way Antigravity does it when Code Assist has none. A project kept with
     /// the sign-in is still the one used; the tiers are asked for anyway.
     static func project(accessToken: String, storedID: String?, session: URLSession,
-                        backend: AntigravityBackend) async throws -> AntigravityProject {
+                        backend: AntigravityBackend, auth: OAuthSession? = nil) async throws -> AntigravityProject {
         let version = await backend.version()
         let userAgent = backend.userAgent(version: version)
         let load: [String: Any]
         do {
             load = try await post(backend.url(backend.loadBase, "loadCodeAssist"), ["metadata": ["ideType": "ANTIGRAVITY"]],
-                                  accessToken: accessToken, headers: ["User-Agent": userAgent], session: session)
-        } catch let error as TranslationError where storedID != nil && error != .cancelled {
-            return AntigravityProject(id: storedID!)
+                                  accessToken: accessToken, headers: ["User-Agent": userAgent], session: session, auth: auth)
+        } catch let error as TranslationError where storedID != nil {
+            switch error {
+            case .cancelled, .unauthorized, .rateLimited, .notConfigured:
+                throw error
+            default:
+                return AntigravityProject(id: storedID!)
+            }
         }
         let current = tierID(load["currentTier"])
         let paid = tierID(load["paidTier"])
@@ -69,7 +74,7 @@ public enum AntigravityAuth {
         ]
         let headers = ["User-Agent": "\(userAgent) google-api-nodejs-client/10.3.0", "X-Goog-Api-Client": "gl-node/22.21.1"]
         for attempt in 0..<onboardAttempts {
-            let reply = try await post(backend.url(backend.base, "onboardUser"), body, accessToken: accessToken, headers: headers, session: session)
+            let reply = try await post(backend.url(backend.base, "onboardUser"), body, accessToken: accessToken, headers: headers, session: session, auth: auth)
             if reply["done"] as? Bool == true {
                 if let id = companionProject((reply["response"] as? [String: Any])?["cloudaicompanionProject"]) {
                     return AntigravityProject(id: id, tier: tier, paid: paid)
@@ -96,15 +101,26 @@ public enum AntigravityAuth {
     }
 
     private static func post(_ url: URL, _ body: [String: Any], accessToken: String, headers: [String: String],
-                             session: URLSession) async throws -> [String: Any] {
+                             session: URLSession, auth: OAuthSession? = nil) async throws -> [String: Any] {
         var request = URLRequest(url: url, timeoutInterval: 20)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, response) = try await HTTP.perform(request, session: session)
-        guard (200..<300).contains(response.statusCode) else { throw HTTP.error(status: response.statusCode, data: data) }
+        let data: Data
+        if let auth {
+            let template = request
+            data = try await auth.send(session: session) { tokens in
+                var request = template
+                request.setValue("Bearer \(tokens.accessToken)", forHTTPHeaderField: "Authorization")
+                return request
+            }
+        } else {
+            let (reply, response) = try await HTTP.perform(request, session: session)
+            guard (200..<300).contains(response.statusCode) else { throw HTTP.error(status: response.statusCode, data: reply) }
+            data = reply
+        }
         return try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
     }
 }
@@ -171,22 +187,53 @@ public actor AntigravityVersion {
     static let manifestURL = URL(string: "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml")!
     static let maxAge: TimeInterval = 6 * 3600
 
+    static let retryDelay: TimeInterval = 60
+
     private let session: URLSession
+    private let now: @Sendable () -> Date
     private var value: String?
     private var checkedAt: Date?
+    private var retryAfter: Date?
+    private var inFlight: (id: UUID, task: Task<String?, Never>)?
 
     public init(session: URLSession) {
         self.session = session
+        self.now = { Date() }
+    }
+
+    init(session: URLSession, now: @escaping @Sendable () -> Date) {
+        self.session = session
+        self.now = now
     }
 
     public func current() async -> String {
-        if let checkedAt, Date().timeIntervalSince(checkedAt) < Self.maxAge { return value ?? Self.fallback }
-        checkedAt = Date()
-        var request = URLRequest(url: Self.manifestURL, timeoutInterval: 5)
-        request.setValue("electron-builder", forHTTPHeaderField: "User-Agent")
-        if let (data, response) = try? await HTTP.perform(request, session: session), response.statusCode == 200,
-           let version = Self.parse(String(decoding: data.prefix(64 * 1024), as: UTF8.self)) {
-            value = version
+        let work: (id: UUID, task: Task<String?, Never>)
+        if let inFlight {
+            work = inFlight
+        } else {
+            if let checkedAt, now().timeIntervalSince(checkedAt) < Self.maxAge { return value ?? Self.fallback }
+            if let retryAfter, now() < retryAfter { return value ?? Self.fallback }
+            let session = self.session
+            work = (UUID(), Task {
+                var request = URLRequest(url: Self.manifestURL, timeoutInterval: 5)
+                request.setValue("electron-builder", forHTTPHeaderField: "User-Agent")
+                guard let (data, response) = try? await HTTP.perform(request, session: session), response.statusCode == 200 else {
+                    return nil
+                }
+                return Self.parse(String(decoding: data.prefix(64 * 1024), as: UTF8.self))
+            })
+            inFlight = work
+        }
+        let version = await work.task.value
+        if inFlight?.id == work.id {
+            inFlight = nil
+            if let version {
+                value = version
+                checkedAt = now()
+                retryAfter = nil
+            } else {
+                retryAfter = now().addingTimeInterval(Self.retryDelay)
+            }
         }
         return value ?? Self.fallback
     }
@@ -266,7 +313,7 @@ public final class AntigravityTranslator: Translator {
         if let stored = tokens.projectID {
             projectID = stored
         } else {
-            projectID = try await AntigravityAuth.project(accessToken: tokens.accessToken, storedID: nil, session: session, backend: backend).id
+            projectID = try await AntigravityAuth.project(accessToken: tokens.accessToken, storedID: nil, session: session, backend: backend, auth: auth).id
         }
         let body: [String: Any] = [
             "project": projectID,
@@ -302,22 +349,34 @@ public final class AntigravityTranslator: Translator {
     /// Joins the non-thought text of each `{response}` chunk in the stream.
     static func outputText(fromEvents data: Data) throws -> String {
         var text = ""
-        for line in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline) {
-            guard line.hasPrefix("data:") else { continue }
-            let json = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-            guard let chunk = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] else { continue }
+        var succeeded = false
+        for json in ServerSentEvents.payloads(from: data) {
+            if json == "[DONE]" { continue }
+            guard let chunk = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] else {
+                throw TranslationError.invalidResponse
+            }
             if let error = chunk["error"] as? [String: Any] {
                 throw TranslationError.rejected(error["message"] as? String ?? "请求失败")
             }
             let response = chunk["response"] as? [String: Any] ?? chunk
+            if let error = response["error"] as? [String: Any] {
+                throw TranslationError.rejected(error["message"] as? String ?? "请求失败")
+            }
+            if let reason = (response["promptFeedback"] as? [String: Any])?["blockReason"] as? String {
+                throw TranslationError.rejected(reason)
+            }
             let candidate = (response["candidates"] as? [[String: Any]])?.first
+            if let reason = candidate?["finishReason"] as? String {
+                guard reason == "STOP" else { throw TranslationError.rejected(reason) }
+                succeeded = true
+            }
             let parts = (candidate?["content"] as? [String: Any])?["parts"] as? [[String: Any]] ?? []
             text += parts
                 .filter { $0["thought"] as? Bool != true }
                 .compactMap { $0["text"] as? String }
                 .joined()
         }
-        guard !text.isEmpty else { throw TranslationError.invalidResponse }
+        guard succeeded, !text.isEmpty else { throw TranslationError.invalidResponse }
         return text
     }
 }

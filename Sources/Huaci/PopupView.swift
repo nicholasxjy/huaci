@@ -21,6 +21,7 @@ final class PopupState: ObservableObject {
     /// Service and model, e.g. "ChatGPT 账号 · gpt-6-luna".
     @Published var serviceLine = ""
     @Published var shortcut = ""
+    @Published var storeError: String?
 
     var result: TranslationResult? {
         if case .result(let result) = content { return result }
@@ -30,7 +31,6 @@ final class PopupState: ObservableObject {
 
 struct PopupActions {
     var copy: (String) -> Void
-    var speak: (TranslationResult) -> Void
     var toggleFavorite: (TranslationResult) -> Void
     var retarget: (String) -> Void
     var togglePin: () -> Void
@@ -44,6 +44,7 @@ struct PopupView: View {
     static let maxBodyHeight: CGFloat = 420
 
     @ObservedObject var state: PopupState
+    let speech: Speech
     let actions: PopupActions
 
     var body: some View {
@@ -64,7 +65,14 @@ struct PopupView: View {
     }
 
     private func panel<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 0, content: content)
+        VStack(alignment: .leading, spacing: 0) {
+            content()
+            if case .result = state.content, let error = state.storeError {
+                Text(error).font(.caption).foregroundStyle(Theme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 18).padding(.bottom, 12)
+            }
+        }
             .frame(width: Self.width, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true)
             .background(.thickMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -85,7 +93,7 @@ struct PopupView: View {
                 closeButton
             }
             ScrollView {
-                ResultContent(result: result, style: .compact, speak: { actions.speak(result) })
+                SpeakingResultContent(result: result, speech: speech)
                     .padding(EdgeInsets(top: 4, leading: 20, bottom: 18, trailing: 20))
             }
             .frame(maxHeight: Self.maxBodyHeight)
@@ -117,6 +125,7 @@ struct PopupView: View {
         .fixedSize()
         .foregroundStyle(.secondary)
         .help("临时换一种目标语言")
+        .accessibilityLabel("目标语言，当前为\(LanguageOption.chineseName(result.targetLanguage))")
     }
 
     private func footer(_ result: TranslationResult) -> some View {
@@ -139,14 +148,7 @@ struct PopupView: View {
                 }
                 .buttonStyle(ActionButtonStyle(tint: state.isFavorite ? Theme.favorite : .primary))
             }
-            Button { actions.speak(result) } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "speaker.wave.2")
-                    Text(result.kind == .word ? "朗读" : "朗读原文")
-                    ShortcutHint(text: "⌘R")
-                }
-            }
-            .buttonStyle(ActionButtonStyle())
+            SpeechActionButton(result: result, speech: speech, shortcut: "⌘R")
             Spacer(minLength: 0)
             Button { actions.openInMainWindow(result) } label: { Image(systemName: "arrow.up.forward.square") }
                 .buttonStyle(IconButtonStyle(size: 30))
@@ -208,21 +210,42 @@ struct PopupView: View {
     private func hint(_ text: String) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "character.cursor.ibeam").font(.system(size: 13))
-            Text(text).font(.system(size: 13))
+            Text(text).font(.system(size: 13)).fixedSize(horizontal: false, vertical: true)
+            Button(action: actions.close) { Image(systemName: "xmark") }
+                .buttonStyle(.plain)
+                .help("关闭（Esc）")
+                .accessibilityLabel("关闭提示")
         }
         .foregroundStyle(.white)
         .padding(.leading, 12)
         .padding(.trailing, 14)
-        .frame(height: 34)
+        .padding(.vertical, 9)
+        .frame(maxWidth: Self.width)
         .background(Color(white: 0.16).opacity(0.92), in: Capsule())
-        .fixedSize()
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
 /// Thin progress line under the popup header. Driven by a timeline rather
 /// than a repeating animation, which would also animate the popup's layout.
 struct IndeterminateBar: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
+        Group {
+            if reduceMotion {
+                Capsule().fill(Theme.accent).frame(maxWidth: .infinity)
+            } else {
+                movingBar
+            }
+        }
+        .frame(height: 2)
+        .background(Color.primary.opacity(0.06))
+        .clipped()
+        .accessibilityLabel("正在翻译")
+    }
+
+    private var movingBar: some View {
         TimelineView(.animation) { context in
             let phase = context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.2) / 1.2
             GeometryReader { geometry in
@@ -232,8 +255,5 @@ struct IndeterminateBar: View {
                     .offset(x: geometry.size.width * (1.34 * phase - 0.34))
             }
         }
-        .frame(height: 2)
-        .background(Color.primary.opacity(0.06))
-        .clipped()
     }
 }

@@ -21,6 +21,9 @@ final class FakePasteboard: PasteboardAccess {
         self.contents = contents
     }
 
+    /// The current owner fills declared types without taking ownership again.
+    func fill(_ contents: PasteboardSnapshot) { self.contents = contents }
+
     func clear() {
         changeCount += 1
         contents = PasteboardSnapshot(items: [])
@@ -31,9 +34,14 @@ final class FakePasteboard: PasteboardAccess {
         return unsavable ? nil : contents
     }
 
-    func restore(_ snapshot: PasteboardSnapshot) {
+    var restoreSucceeds = true
+
+    @discardableResult
+    func restore(_ snapshot: PasteboardSnapshot) -> Bool {
         restoreCalls += 1
+        guard restoreSucceeds else { return false }
         write(snapshot)
+        return true
     }
 
     func readString() -> String? {
@@ -55,18 +63,23 @@ final class FakeEnvironment: SelectionEnvironment {
     var onCopy: (() -> Void)?
     /// Runs on each poll, e.g. to switch apps mid-copy.
     var onSleep: (() -> Void)?
+    var onSleepAsync: (() async -> Void)?
     private(set) var copyCount = 0
 
     func isAccessibilityTrusted() -> Bool { trusted }
     func frontmostProcessID() -> pid_t? { frontmost }
     func readSelectedText(pid: pid_t) -> AccessibilityReadResult { accessibility }
-    func waitForModifierRelease() async {}
+    var modifiersReleased = true
+    func waitForModifierRelease() async -> Bool { modifiersReleased }
     func sendCopyCommand() -> Bool {
         copyCount += 1
         onCopy?()
         return true
     }
-    func sleep(milliseconds: Int) async { onSleep?() }
+    func sleep(milliseconds: Int) async {
+        onSleep?()
+        await onSleepAsync?()
+    }
 }
 
 @MainActor
@@ -98,7 +111,7 @@ struct SelectionCaptureTests {
 
     @Test func copyFallbackRestoresAllItemsAndTypes() async {
         let environment = FakeEnvironment()
-        environment.accessibility = .empty
+        environment.accessibility = .unavailable
         let pasteboard = FakePasteboard(original)
         environment.onCopy = { pasteboard.write(FakePasteboard.text("copied selection")) }
 
@@ -116,7 +129,7 @@ struct SelectionCaptureTests {
         environment.onCopy = { pasteboard.clear() }
         environment.onSleep = {
             polls += 1
-            if polls == 3 { pasteboard.write(FakePasteboard.text("late text")) }
+            if polls == 3 { pasteboard.fill(FakePasteboard.text("late text")) }
         }
 
         let outcome = await makeCapturer(environment, pasteboard).capture(expectedPID: 42)
@@ -212,12 +225,137 @@ struct SelectionCaptureTests {
 
     @Test func whitespaceSelectionIsRejected() async {
         let environment = FakeEnvironment()
-        environment.accessibility = .text("   \n")
+        environment.accessibility = .unavailable
         let pasteboard = FakePasteboard(original)
         environment.onCopy = { pasteboard.write(FakePasteboard.text("  ")) }
 
         #expect(await makeCapturer(environment, pasteboard).capture(expectedPID: 42) == .failure(.noText))
         #expect(pasteboard.contents == original)
+    }
+
+    @Test func overlappingCapturesWaitForClipboardCleanup() async {
+        let environment = FakeEnvironment()
+        let pasteboard = FakePasteboard(original)
+        let gate = SelectionPollGate()
+        var polls = 0
+        environment.onCopy = { pasteboard.write(FakePasteboard.text("selection \(environment.copyCount)")) }
+        environment.onSleepAsync = {
+            polls += 1
+            if polls == 1 { await gate.wait() }
+        }
+        let capturer = makeCapturer(environment, pasteboard)
+        let first = Task { await capturer.capture(expectedPID: 42) }
+        await gate.waitUntilEntered()
+        let second = Task { await capturer.capture(expectedPID: 42) }
+        for _ in 0..<20 { await Task.yield() }
+        #expect(environment.copyCount == 1)
+        gate.release()
+
+        #expect(await first.value == .success(text: "selection 1", method: .copy))
+        #expect(await second.value == .success(text: "selection 2", method: .copy))
+        #expect(pasteboard.contents == original)
+    }
+
+    @Test func cancellationAfterCopyStillRestoresDelayedWrite() async {
+        let environment = FakeEnvironment()
+        let pasteboard = FakePasteboard(original)
+        let gate = SelectionPollGate()
+        var waits = 0
+        environment.onSleepAsync = {
+            if waits == 0 { await gate.wait() }
+            do { try await Task.sleep(nanoseconds: 1_000_000) }
+            catch { return }
+            waits += 1
+            if waits == 3 { pasteboard.write(FakePasteboard.text("delayed selection")) }
+        }
+        let capturer = makeCapturer(environment, pasteboard)
+        let task = Task { await capturer.capture(expectedPID: 42) }
+        await gate.waitUntilEntered()
+        task.cancel()
+        gate.release()
+
+        #expect(await task.value == .failure(.cancelled))
+        #expect(pasteboard.contents == original)
+        #expect(pasteboard.restoreCalls == 1)
+    }
+
+    @Test func heldModifiersDoNotSendCopy() async {
+        let environment = FakeEnvironment()
+        environment.modifiersReleased = false
+        let pasteboard = FakePasteboard(original)
+
+        #expect(await makeCapturer(environment, pasteboard).capture(expectedPID: 42) == .failure(.modifiersHeld))
+        #expect(environment.copyCount == 0)
+        #expect(pasteboard.contents == original)
+    }
+
+    @Test func restoreFailureIsReported() async {
+        let environment = FakeEnvironment()
+        let pasteboard = FakePasteboard(original)
+        pasteboard.restoreSucceeds = false
+        environment.onCopy = { pasteboard.write(FakePasteboard.text("selection")) }
+
+        #expect(await makeCapturer(environment, pasteboard).capture(expectedPID: 42) == .failure(.clipboardRestoreFailed))
+        #expect(pasteboard.restoreCalls == 1)
+    }
+
+    @Test func knownEmptySelectionDoesNotCopyAnEditorLine() async {
+        let environment = FakeEnvironment()
+        environment.accessibility = .empty
+        let pasteboard = FakePasteboard(original)
+        environment.onCopy = { pasteboard.write(FakePasteboard.text("whole editor line")) }
+
+        let outcome = await makeCapturer(environment, pasteboard).capture(expectedPID: 42)
+
+        #expect(outcome == .failure(.noText))
+        #expect(environment.copyCount == 0)
+        #expect(pasteboard.contents == original)
+    }
+
+    @Test func newUserCopyAfterObservedClearIsNeverAdopted() async {
+        let environment = FakeEnvironment()
+        let pasteboard = FakePasteboard(original)
+        var polls = 0
+        environment.onCopy = { pasteboard.clear() }
+        environment.onSleep = {
+            polls += 1
+            if polls == 2 { pasteboard.write(FakePasteboard.text("new user clipboard")) }
+        }
+
+        let outcome = await makeCapturer(environment, pasteboard).capture(expectedPID: 42)
+
+        #expect(outcome == .failure(.clipboardChanged))
+        #expect(pasteboard.contents == FakePasteboard.text("new user clipboard"))
+        #expect(pasteboard.restoreCalls == 0)
+    }
+
+    @Test func multipleWritesBeforeFirstReadPreserveNewClipboard() async {
+        let environment = FakeEnvironment()
+        let pasteboard = FakePasteboard(original)
+        environment.onCopy = {
+            pasteboard.write(FakePasteboard.text("selected text"))
+            pasteboard.write(FakePasteboard.text("new user clipboard"))
+        }
+
+        let outcome = await makeCapturer(environment, pasteboard).capture(expectedPID: 42)
+
+        #expect(outcome != .success(text: "new user clipboard", method: .copy))
+        #expect(pasteboard.contents == FakePasteboard.text("new user clipboard"))
+        #expect(pasteboard.restoreCalls == 0)
+    }
+
+    @Test func cancelledCaptureBeforeStartDoesNotReadSelection() async {
+        let environment = FakeEnvironment()
+        environment.accessibility = .text("selected text")
+        let pasteboard = FakePasteboard(original)
+        let capturer = makeCapturer(environment, pasteboard)
+        let task = Task { @MainActor in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await capturer.capture(expectedPID: 42)
+        }
+
+        #expect(await task.value == .failure(.cancelled))
+        #expect(pasteboard.snapshotCalls == 0)
     }
 
     @Test func missingPermissionIsReported() async {

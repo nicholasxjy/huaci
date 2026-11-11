@@ -12,6 +12,7 @@ struct ServiceSettings: View {
                 .padding(.top, 20)
             Form {
                 ServiceForm(service: settings.activeService)
+                    .id(settings.activeService)
             }
             .formStyle(.grouped)
         }
@@ -115,14 +116,20 @@ struct PersonalAPIForm: View {
     @EnvironmentObject private var settings: AppSettings
     @State private var apiKey = ""
     @State private var hasSavedKey = false
-    @State private var busy = false
+    @State private var testTask: Task<Void, Never>?
     @State private var message: String?
+    @State private var messageIdentity: ConfigurationLifecycle.Identity?
     @State private var failed = false
 
     var body: some View {
         Section {
             TextField("服务地址", text: $settings.personalBaseURL, prompt: Text("https://api.openai.com/v1"))
-            SecureField("API Key", text: $apiKey, prompt: Text(hasSavedKey ? "已保存；输入新 Key 可替换" : "sk-…"))
+            SecureField("API Key", text: Binding(get: { apiKey }, set: { value in
+                apiKey = value
+                testTask?.cancel()
+                model.configuration.invalidate(.personalAPI)
+                message = nil
+            }), prompt: Text(hasSavedKey ? "已保存；输入新 Key 可替换" : "sk-…"))
                 .onSubmit(save)
             if hasSavedKey || !apiKey.isEmpty {
                 LabeledContent("钥匙串") {
@@ -132,46 +139,63 @@ struct PersonalAPIForm: View {
                         } else {
                             Text("已保存").foregroundStyle(.secondary)
                             Button("删除", role: .destructive) {
-                                model.keychain.delete(.personalAPIKey)
-                                hasSavedKey = false
-                                model.dataChanged()
+                                if model.deleteAPIKey() {
+                                    hasSavedKey = model.keychain.contains(.personalAPIKey)
+                                    message = nil
+                                } else {
+                                    message = "从钥匙串删除失败。"
+                                    failed = true
+                                    messageIdentity = model.configuration.identity(for: .personalAPI)
+                                }
                             }
                         }
                     }
                 }
             }
             ModelPicker(service: .personalAPI, model: $settings.personalModel, prompt: "例如 gpt-4o-mini",
-                        canFetch: hasSavedKey && !settings.personalBaseURL.isEmpty)
-            ConnectionRow(busy: busy, message: message, failed: failed, enabled: true) {
-                Task { await test() }
-            }
+                        canFetch: hasSavedKey && apiKey.isEmpty && !settings.personalBaseURL.isEmpty)
+            ConnectionRow(state: model.configuration.connections[.personalAPI], fallbackMessage: message,
+                          fallbackFailed: failed, enabled: true, test: test)
         } header: {
             if showsHeader { Text("个人 API") }
         } footer: {
             Footnote(text: "支持 OpenAI 兼容的 Chat Completions 接口。API Key 只保存在本机钥匙串，并且只发送到上面的服务地址。")
         }
         .onAppear { hasSavedKey = model.keychain.contains(.personalAPIKey) }
-    }
-
-    private func save() {
-        guard !apiKey.isEmpty else { return }
-        if model.keychain.write(apiKey, for: .personalAPIKey) {
-            apiKey = ""
-            hasSavedKey = true
-            message = "Key 已保存到钥匙串。"
-            failed = false
-            model.dataChanged()
-        } else {
-            message = "保存到钥匙串失败。"
-            failed = true
+        .onChange(of: model.configuration.identity(for: .personalAPI)) { identity in
+            hasSavedKey = model.keychain.contains(.personalAPIKey)
+            if messageIdentity != identity { message = nil }
+        }
+        .onDisappear {
+            testTask?.cancel()
+            model.configuration.invalidate(.personalAPI, catalog: false)
         }
     }
 
-    private func test() async {
-        if !apiKey.isEmpty { save() }
-        busy = true
-        defer { busy = false }
-        (message, failed) = await model.testConnection()
+    private func save() { _ = saveDraft() }
+
+    private func saveDraft() -> Bool {
+        guard !apiKey.isEmpty else { return true }
+        if model.saveAPIKey(apiKey) {
+            apiKey = ""
+            hasSavedKey = model.keychain.contains(.personalAPIKey)
+            message = hasSavedKey ? "Key 已保存到钥匙串。" : "Key 已删除。"
+            failed = false
+            messageIdentity = model.configuration.identity(for: .personalAPI)
+            return true
+        }
+        message = "保存到钥匙串失败。"
+        failed = true
+        messageIdentity = model.configuration.identity(for: .personalAPI)
+        return false
+    }
+
+    private func test() {
+        guard saveDraft() else { return }
+        message = nil
+        testTask?.cancel()
+        let identity = model.configuration.identity(for: .personalAPI)
+        testTask = Task { await model.testConnection(for: .personalAPI, identity: identity) }
     }
 }
 
@@ -184,10 +208,9 @@ private struct OAuthServiceForm: View {
 
     @EnvironmentObject private var appModel: AppModel
     @State private var signInTask: Task<Void, Never>?
+    @State private var signInID: UUID?
     @State private var signInError: String?
-    @State private var busy = false
-    @State private var message: String?
-    @State private var failed = false
+    @State private var testTask: Task<Void, Never>?
 
     var body: some View {
         Section {
@@ -203,7 +226,7 @@ private struct OAuthServiceForm: View {
                             .accessibilityHidden(true)
                         Text(name).textSelection(.enabled)
                         Button("退出登录") {
-                            message = nil
+                            testTask?.cancel()
                             Task { await appModel.signOut(service) }
                         }
                     } else if signInTask != nil {
@@ -224,12 +247,11 @@ private struct OAuthServiceForm: View {
             }
             ModelPicker(service: service, model: $model, prompt: service.suggestedModels.first ?? "",
                         canFetch: appModel.accounts[service] != nil)
-            ConnectionRow(busy: busy, message: message, failed: failed, enabled: appModel.accounts[service] != nil) {
-                Task {
-                    busy = true
-                    (message, failed) = await appModel.testConnection()
-                    busy = false
-                }
+            ConnectionRow(state: appModel.configuration.connections[service], fallbackMessage: nil,
+                          fallbackFailed: false, enabled: appModel.accounts[service] != nil) {
+                testTask?.cancel()
+                let identity = appModel.configuration.identity(for: service)
+                testTask = Task { await appModel.testConnection(for: service, identity: identity) }
             }
         } header: {
             Text(service.shortName)
@@ -245,42 +267,61 @@ private struct OAuthServiceForm: View {
             }
         }
         // Frees the callback port when the form goes away mid sign-in.
-        .onDisappear { signInTask?.cancel() }
+        .onDisappear {
+            signInTask?.cancel()
+            signInTask = nil
+            signInID = nil
+            testTask?.cancel()
+            appModel.configuration.invalidate(service, catalog: false)
+        }
     }
 
     private func signIn() {
         signInError = nil
-        message = nil
+        let id = UUID()
+        signInID = id
         signInTask = Task {
+            defer {
+                if signInID == id {
+                    signInTask = nil
+                    signInID = nil
+                }
+            }
             do {
                 try await appModel.signIn(service)
             } catch TranslationError.cancelled {
                 // Cancelled by the user or the form closing.
             } catch {
+                guard signInID == id, !Task.isCancelled else { return }
                 signInError = (error as? TranslationError)?.userMessage ?? error.localizedDescription
             }
-            signInTask = nil
         }
     }
 }
 
 /// Result of the last connection test and the button that runs it.
 private struct ConnectionRow: View {
-    let busy: Bool
-    let message: String?
-    let failed: Bool
+    let state: ConfigurationLifecycle.Connection?
+    let fallbackMessage: String?
+    let fallbackFailed: Bool
     let enabled: Bool
     let test: () -> Void
+
+    private var busy: Bool { state == .testing }
+    private var feedback: (message: String?, failed: Bool) {
+        if case .finished(let message, let failed) = state { return (message, failed) }
+        return (fallbackMessage, fallbackFailed)
+    }
 
     var body: some View {
         LabeledContent("连接") {
             HStack(spacing: 10) {
                 if busy {
                     ProgressView().controlSize(.small)
-                } else if let message {
-                    Label(message, systemImage: failed ? "xmark.circle.fill" : "checkmark")
+                } else if let message = feedback.message {
+                    Label(message, systemImage: feedback.failed ? "xmark.circle.fill" : "checkmark")
                         .font(.system(size: 12))
-                        .foregroundStyle(failed ? Theme.danger : Theme.success)
+                        .foregroundStyle(feedback.failed ? Theme.danger : Theme.success)
                         .lineLimit(3)
                         .multilineTextAlignment(.trailing)
                 } else {
@@ -296,18 +337,32 @@ private struct ConnectionRow: View {
 /// fetched once credentials are available (on open, after saving a key or
 /// signing in); until then the suggested names are offered. Names can still be
 /// typed by hand.
-private struct ModelPicker: View {
+struct ModelPicker: View {
     let service: TranslationService
     @Binding var model: String
     let prompt: String
     let canFetch: Bool
 
     @EnvironmentObject private var appModel: AppModel
-    @State private var loading = false
-    @State private var error: String?
+    @State private var refreshRequest: RefreshRequest?
 
-    private var fetched: [RemoteModel]? { appModel.remoteModels[service] }
-    private var choices: [RemoteModel] { fetched ?? service.suggestedModels.map { RemoteModel(id: $0) } }
+    private struct RefreshRequest: Hashable {
+        let configuration: ConfigurationLifecycle.Identity
+        let nonce = UUID()
+    }
+
+    private struct RequestID: Hashable {
+        let configuration: ConfigurationLifecycle.Identity
+        let canFetch: Bool
+        let refresh: RefreshRequest?
+    }
+
+    private var loading: Bool { appModel.configuration.loadingModels.contains(service) }
+    private var error: String? { appModel.configuration.catalogErrors[service] }
+
+    private var fetched: [RemoteModel]? { appModel.configuration.remoteModels[service] }
+    private var choices: [RemoteModel] { fetched ?? service.suggestedModels.map { RemoteModel(id: $0, isSuggested: true) } }
+    private var suggestionsOnly: Bool { !choices.isEmpty && choices.allSatisfy(\.isSuggested) }
 
     var body: some View {
         LabeledContent("模型") {
@@ -334,10 +389,13 @@ private struct ModelPicker: View {
                 .fixedSize()
                 .disabled(choices.isEmpty)
                 .help("选择模型")
+                .accessibilityLabel("选择模型")
                 if loading {
                     ProgressView().controlSize(.small)
                 } else {
-                    Button { Task { await fetch() } } label: { Image(systemName: "arrow.clockwise") }
+                    Button {
+                        refreshRequest = RefreshRequest(configuration: appModel.configuration.catalogIdentity(for: service))
+                    } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(IconButtonStyle(size: 24))
                         .help("从服务器刷新模型列表")
                         .accessibilityLabel("刷新模型列表")
@@ -345,27 +403,23 @@ private struct ModelPicker: View {
                 }
             }
         }
-        .task(id: canFetch) {
-            if canFetch && fetched == nil { await fetch() }
+        .task(id: RequestID(configuration: appModel.configuration.catalogIdentity(for: service), canFetch: canFetch, refresh: refreshRequest)) {
+            let identity = appModel.configuration.catalogIdentity(for: service)
+            let explicitlyRequested = refreshRequest?.configuration == identity
+            guard canFetch, service != .personalAPI || explicitlyRequested else { return }
+            if fetched == nil || explicitlyRequested { await appModel.fetchModels(for: service, identity: identity) }
         }
         if let error {
             Text("获取模型列表失败：\(error)").font(.caption).foregroundStyle(Theme.danger)
                 .fixedSize(horizontal: false, vertical: true)
+        } else if service == .personalAPI, fetched == nil {
+            Text("点击右侧刷新按钮，获取当前地址的模型列表。").font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if suggestionsOnly {
+            Text("模型名称为本地建议，尚未确认当前账号可用。").font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         } else if let fetched, !model.isEmpty, !fetched.contains(where: { $0.id == model }) {
             Text("当前模型不在服务器返回的列表中，可能无法使用。").font(.caption).foregroundStyle(Theme.warning)
-        }
-    }
-
-    private func fetch() async {
-        loading = true
-        defer { loading = false }
-        do {
-            try await appModel.fetchModels(for: service)
-            error = nil
-        } catch TranslationError.cancelled {
-            // The form went away mid-request.
-        } catch {
-            self.error = (error as? TranslationError)?.userMessage ?? error.localizedDescription
         }
     }
 }

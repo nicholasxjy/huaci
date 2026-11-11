@@ -101,15 +101,22 @@ public final class ChatGPTTranslator: Translator {
     static func outputText(fromEvents data: Data) throws -> String {
         var deltas = ""
         var completed: String?
-        for line in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline) {
-            guard line.hasPrefix("data:") else { continue }
-            let json = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-            guard let event = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] else { continue }
+        var succeeded = false
+        for json in ServerSentEvents.payloads(from: data) {
+            if json == "[DONE]" { continue }
+            guard let event = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] else {
+                throw TranslationError.invalidResponse
+            }
             let response = event["response"] as? [String: Any]
             switch event["type"] as? String {
             case "response.output_text.delta":
                 deltas += event["delta"] as? String ?? ""
             case "response.completed", "response.done":
+                let status = response?["status"] as? String
+                guard status == "completed" || (status == nil && event["type"] as? String == "response.completed") else {
+                    throw TranslationError.rejected(status ?? "请求未完成")
+                }
+                succeeded = true
                 let output = response?["output"] as? [[String: Any]] ?? []
                 let text = output
                     .filter { $0["type"] as? String == "message" }
@@ -127,7 +134,7 @@ public final class ChatGPTTranslator: Translator {
             }
         }
         let text = completed ?? deltas
-        guard !text.isEmpty else { throw TranslationError.invalidResponse }
+        guard succeeded, !text.isEmpty else { throw TranslationError.invalidResponse }
         return text
     }
 }

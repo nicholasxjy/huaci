@@ -131,6 +131,19 @@ struct TranslationCacheStoreTests {
         #expect(try store.cachedResult(for: request("bank", kind: .text)) == nil)
     }
 
+    @Test func embeddedNULCacheKeysRemainDistinct() throws {
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try HistoryStore(url: url)
+        let embedded = request("ab\u{0000}cd")
+        let prefix = request("ab")
+        try store.cache(result(for: embedded, "embedded"), for: embedded)
+        #expect(try store.cachedResult(for: prefix) == nil)
+        try store.cache(result(for: prefix, "prefix"), for: prefix)
+        #expect(try store.translationCacheCount() == 2)
+        #expect(try store.cachedResult(for: embedded)?.translation == "embedded")
+        #expect(try store.cachedResult(for: prefix)?.translation == "prefix")
+    }
+
     @Test func cachingAgainReplacesAndPersists() throws {
         defer { try? FileManager.default.removeItem(at: url) }
         let bank = request("bank")
@@ -195,5 +208,147 @@ struct TranslationCacheStoreTests {
         let bank = request("bank")
         try store.cache(result(for: bank, "银行"), for: bank)
         #expect(try store.cachedResult(for: bank)?.translation == "银行")
+    }
+}
+
+struct StorageBoundaryTests {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("huaci-boundary-\(UUID().uuidString).sqlite")
+
+    func sql(_ statement: String) throws {
+        var db: OpaquePointer?
+        #expect(sqlite3_open(url.path, &db) == SQLITE_OK)
+        defer { sqlite3_close(db) }
+        #expect(sqlite3_exec(db, statement, nil, nil, nil) == SQLITE_OK)
+    }
+
+    func result(_ text: String = "healthy") -> TranslationResult {
+        TranslationResult(kind: .text, sourceText: text, sourceLanguage: "en", targetLanguage: "zh-Hans", translation: "健康", word: nil)
+    }
+
+    @Test func malformedRowsWarnWithoutLosingHealthyRowsOrChangingCounts() throws {
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try HistoryStore(url: url)
+        try store.addHistory(result())
+        let damagedID = try store.addHistory(result("damaged"))
+        try store.addFavorite(result())
+        try store.addFavorite(result("damaged"))
+        // A NUL after valid JSON must not make the trailing damage invisible.
+        try sql("UPDATE history SET payload = payload || char(0) || 'garbage' WHERE id = \(damagedID); UPDATE favorites SET payload = 'not JSON' WHERE headword = 'damaged';")
+        let history = try store.historySnapshot()
+        let favorites = try store.favoritesSnapshot()
+        #expect(history.items.map(\.result.sourceText) == ["healthy"])
+        #expect(favorites.items.map(\.result.sourceText) == ["healthy"])
+        #expect(history.warnings.count == 1)
+        #expect(history.warnings[0].contains("history #\(damagedID)"))
+        #expect(favorites.warnings.count == 1)
+        #expect(throws: StoreError.self) { try store.history() }
+        #expect(throws: StoreError.self) { try store.favorites() }
+        #expect(try store.historyCount() == 2)
+        #expect(try store.favoritesCount() == 2)
+        // Reads neither delete nor repair malformed records.
+        #expect(try store.historySnapshot().warnings.count == 1)
+        #expect(try store.favoritesSnapshot().warnings.count == 1)
+    }
+
+    @Test func invalidUTF8PayloadWarnsRatherThanChangingTheDecodedText() throws {
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try HistoryStore(url: url)
+        try store.addHistory(result())
+        try sql("UPDATE history SET payload = replace(payload, 'healthy', CAST(X'FF' AS TEXT))")
+        let snapshot = try store.historySnapshot()
+        #expect(snapshot.items.isEmpty)
+        #expect(snapshot.warnings.count == 1)
+        #expect(snapshot.warnings[0].contains("Invalid UTF-8"))
+        #expect(try store.historyCount() == 1)
+    }
+
+    @Test func malformedCacheIsAnErrorRatherThanAMiss() throws {
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try HistoryStore(url: url)
+        let request = TranslationRequest(text: "healthy", kind: .text, sourceLanguage: "en", targetLanguage: .named("zh-Hans"))
+        try store.cache(result(), for: request)
+        try sql("UPDATE translation_cache SET payload = 'invalid'")
+        #expect(throws: DecodingError.self) { try store.cachedResult(for: request) }
+        #expect(try store.translationCacheCount() == 1)
+    }
+
+    @Test func bindFailuresFinalizeStatementsAndKeepConnectionUsable() throws {
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try HistoryStore(url: url)
+        let probe = try store.prepare("SELECT 1", [])
+        let db = try #require(sqlite3_db_handle(probe))
+        sqlite3_finalize(probe)
+        for value: HistoryStore.Value in [.text("text"), .int(2), .real(3)] {
+            #expect(throws: StoreError.self) {
+                let unexpected = try store.prepare("SELECT ?", [.int(1), value])
+                sqlite3_finalize(unexpected)
+            }
+            #expect(sqlite3_next_stmt(db, nil) == nil)
+        }
+        let oldLimit = sqlite3_limit(db, SQLITE_LIMIT_LENGTH, 1024)
+        #expect(throws: StoreError.self) {
+            let unexpected = try store.prepare("SELECT ?", [.text(String(repeating: "界", count: 1024))])
+            sqlite3_finalize(unexpected)
+        }
+        #expect(sqlite3_next_stmt(db, nil) == nil)
+        sqlite3_limit(db, SQLITE_LIMIT_LENGTH, oldLimit)
+        try store.addHistory(result())
+        #expect(try store.historyCount() == 1)
+    }
+
+    @Test func currentSchemaDoesNotRequireAWriterLockToOpen() throws {
+        defer { try? FileManager.default.removeItem(at: url) }
+        do {
+            let store = try HistoryStore(url: url)
+            try store.addHistory(result())
+        }
+        var db: OpaquePointer?
+        #expect(sqlite3_open(url.path, &db) == SQLITE_OK)
+        defer { sqlite3_close(db) }
+        #expect(sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK)
+        defer { sqlite3_exec(db, "ROLLBACK", nil, nil, nil) }
+        let reopened = try HistoryStore(url: url)
+        #expect(try reopened.historyCount() == 1)
+    }
+
+    @Test func failedMigrationRollsBackSchemaAndVersion() throws {
+        defer { try? FileManager.default.removeItem(at: url) }
+        // This table blocks creation of the history index after history is created.
+        try sql("CREATE TABLE history_created_at (sentinel TEXT); INSERT INTO history_created_at VALUES ('keep');")
+        #expect(throws: StoreError.self) { try HistoryStore(url: url) }
+        var db: OpaquePointer?
+        #expect(sqlite3_open(url.path, &db) == SQLITE_OK)
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        #expect(sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &statement, nil) == SQLITE_OK)
+        #expect(sqlite3_step(statement) == SQLITE_ROW)
+        #expect(sqlite3_column_int(statement, 0) == 0)
+        sqlite3_finalize(statement)
+        #expect(sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE name = 'history'", -1, &statement, nil) == SQLITE_OK)
+        #expect(sqlite3_step(statement) == SQLITE_DONE)
+        sqlite3_finalize(statement)
+        // Recover the conflicting schema and retry, retaining the original table/data.
+        try sql("ALTER TABLE history_created_at RENAME TO preserved;")
+        let reopened = try HistoryStore(url: url)
+        try reopened.addHistory(result())
+        #expect(try reopened.historyCount() == 1)
+        #expect(sqlite3_prepare_v2(db, "SELECT sentinel FROM preserved", -1, &statement, nil) == SQLITE_OK)
+        #expect(sqlite3_step(statement) == SQLITE_ROW)
+        #expect(String(cString: sqlite3_column_text(statement, 0)) == "keep")
+        sqlite3_finalize(statement)
+    }
+
+    @Test func favoriteIdentityPreservesUTF8NULAndOriginalSaveDate() throws {
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try HistoryStore(url: url)
+        let original = result("界\u{0000}🙂")
+        try store.addFavorite(original, at: Date(timeIntervalSince1970: 1))
+        try store.addFavorite(result("界"), at: Date(timeIntervalSince1970: 2))
+        try store.addFavorite(original, at: Date(timeIntervalSince1970: 3))
+        #expect(try store.favoritesCount() == 2)
+        #expect(try store.favorites().first(where: { $0.result == original })?.createdAt == Date(timeIntervalSince1970: 1))
+        try store.removeFavorite(headword: "界", targetLanguage: "zh-Hans")
+        #expect(try store.isFavorite(headword: original.sourceText, targetLanguage: "zh-Hans"))
+        #expect(try !store.isFavorite(headword: "界", targetLanguage: "zh-Hans"))
     }
 }
